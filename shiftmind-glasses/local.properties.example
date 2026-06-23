@@ -1,0 +1,13 @@
+# Per-developer config. NOT committed to git (see .gitignore).
+# Android Studio also writes its SDK path here; we tack on ShiftMind-specific keys.
+
+# Required: laptop server URL the glasses POST to.
+# Find your laptop's LAN IP:
+#   macOS:  ipconfig getifaddr en0      (use en1 for some MBPs on WiFi)
+#   linux:  hostname -I | awk '{print $1}'
+#   win:    ipconfig (IPv4 of the WiFi adapter)
+# Glasses + laptop must be on the same WiFi network.
+shiftmind.serverUrl=http://10.0.0.10:8000
+
+# Optional: frames per second the glasses upload to /api/preview-frame.
+shiftmind.previewFps=5

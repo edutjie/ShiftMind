@@ -1,0 +1,19 @@
+# Repo-root catchall. Module-specific ignores live in:
+#   shiftmind-glasses/.gitignore   (Android / Gradle / signing)
+#   shiftmind-server/.gitignore    (Python / uv / caches)
+
+# ───── OS / editor cruft ─────
+.DS_Store
+Thumbs.db
+*.swp
+*~
+
+# Editor settings (IDE configs are per-developer)
+.vscode/
+.idea/
+
+# Common secret / scratch patterns at root
+.env
+.env.local
+scratch/
+tmp/

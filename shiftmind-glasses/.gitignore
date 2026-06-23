@@ -1,0 +1,46 @@
+# ───── Gradle / Android build outputs ─────
+.gradle/
+build/
+captures/
+.cxx/
+out/
+release/
+
+# ───── IDE state ─────
+.idea/
+*.iml
+*.ipr
+*.iws
+.kotlin/
+
+# Android Studio captures profiler output here (large, throwaway)
+captures/
+
+# ───── Per-developer config ─────
+# local.properties holds sdk.dir + shiftmind.serverUrl (LAN IP).
+# Never commit — committing your IP forces every dev to either rebuild
+# or hand-edit on pull. See local.properties.example for the template.
+local.properties
+
+# Keystore / signing material — never commit
+*.jks
+*.keystore
+keystore.properties
+
+# ───── Build outputs ─────
+*.apk
+*.aab
+*.aar
+*.dex
+mapping.txt
+
+# Lint / instrumentation results
+lint-results*
+reports/
+test-results/
+
+# ───── OS / editor cruft ─────
+.DS_Store
+Thumbs.db
+*.swp
+*~

@@ -1,0 +1,55 @@
+# ───── Python ─────
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+
+# ───── uv / virtualenv ─────
+# .venv is created by `uv sync`; reproducible from pyproject.toml + uv.lock.
+.venv/
+venv/
+env/
+
+# DO commit:
+#   pyproject.toml  — dependency manifest
+#   uv.lock         — pinned reproducible install
+#   .python-version — version pin for `uv run`
+
+# ───── Tooling caches ─────
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+.pyright/
+.coverage
+htmlcov/
+coverage.xml
+*.cover
+
+# ───── Build artifacts ─────
+dist/
+build/
+*.egg-info/
+*.egg
+
+# ───── Per-developer config / secrets ─────
+.env
+.env.local
+*.env.local
+
+# ───── Recorded media (dev only — don't push laptop test captures) ─────
+*.mp4
+*.mkv
+*.wav
+*.mp3
+*.jpg
+*.jpeg
+*.png
+# but allow icons / fixtures we may add deliberately under api/static/
+!api/static/**
+
+# ───── OS / editor cruft ─────
+.DS_Store
+Thumbs.db
+*.swp
+*~
+.vscode/
