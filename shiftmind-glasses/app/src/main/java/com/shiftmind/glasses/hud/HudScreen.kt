@@ -9,23 +9,34 @@ import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.padding
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.LaunchedEffect
+import androidx.compose.runtime.collectAsState
+import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableStateOf
+import androidx.compose.runtime.remember
+import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
+import kotlinx.coroutines.delay
 
 /**
- * HUD root.
+ * HUD root, driven by [HudStateHolder].
  *
  * Layout:
  *   ┌─────────────────────────┐
- *   │  ShiftMind              │  ← title TopCenter (with top padding for prism FOV)
- *   │  awaiting customer      │
+ *   │ ShiftMind          ● REC│  ← title TopCenter + recording indicator TopEnd
+ *   │ awaiting customer       │
  *   │                         │
+ *   │   ┌────────────┐        │  ← customer card (when populated)
+ *   │   │ John D.    │        │
+ *   │   │ Last visit │        │
+ *   │   └────────────┘        │
  *   │       ┌──┐              │
- *   │       │  │  BoxCursor   │  ← centered both axes — natural face position
+ *   │       │  │  BoxCursor   │  ← centered both axes
  *   │       └──┘              │
  *   │                         │
  *   └─────────────────────────┘
@@ -33,29 +44,40 @@ import androidx.compose.ui.unit.sp
  * NOTE on prism mirror: the rokid_android_dev_guide.md claims `scaleX = -1f`
  * is required to un-mirror prism output. On Rokid Max Pro the prism does NOT
  * mirror the wearer's view, so applying the flag produces reversed text.
- * Removed for Max Pro. If a different Rokid model needs it, re-add the flag
- * to the root Box (or gate it on Build.MODEL).
+ * Removed for Max Pro. See CLAUDE.md for the diagnostic.
  */
 @Composable
 fun HudScreen() {
+    val state by HudStateHolder.stateFlow.collectAsState()
+    val recordingStartedAtMs = remember(state.recordingActive) {
+        if (state.recordingActive) System.currentTimeMillis() else 0L
+    }
+    var recordingNowMs by remember { mutableStateOf(System.currentTimeMillis()) }
+
+    LaunchedEffect(state.recordingActive, recordingStartedAtMs) {
+        if (!state.recordingActive) return@LaunchedEffect
+        while (true) {
+            recordingNowMs = System.currentTimeMillis()
+            delay(1_000L)
+        }
+    }
+
     Box(
         modifier = Modifier
             .fillMaxSize()
             .background(Color.Black),
     ) {
-        // BoxCursor at true screen center — the place the wearer will naturally
-        // align with a customer's face. Drawn first so the title overlay sits
-        // above it on the z-axis.
+        // BoxCursor — natural face slot. Drawn first so other overlays stack above.
         Box(
             modifier = Modifier
                 .fillMaxSize()
-                .padding(top = 60.dp),  // small visual offset so cursor + title don't crowd
+                .padding(top = 60.dp),
             contentAlignment = Alignment.Center,
         ) {
             BoxCursor()
         }
 
-        // Title block: top of viewport, with prism FOV padding.
+        // Title + status block — top of viewport, with prism FOV padding.
         Column(
             modifier = Modifier
                 .fillMaxSize()
@@ -63,17 +85,63 @@ fun HudScreen() {
             horizontalAlignment = Alignment.CenterHorizontally,
         ) {
             Text(
-                text = "ShiftMind",
+                text = state.title,
                 color = Color(0xFF00FF00),
                 fontSize = 28.sp,
                 fontWeight = FontWeight.Bold,
             )
-            Spacer(Modifier.height(4.dp))
-            Text(
-                text = "awaiting customer",
-                color = Color.White.copy(alpha = 0.65f),
-                fontSize = 12.sp,
-            )
+            state.statusLine?.let { line ->
+                Spacer(Modifier.height(4.dp))
+                Text(
+                    text = line,
+                    color = Color.White.copy(alpha = 0.65f),
+                    fontSize = 12.sp,
+                )
+            }
+        }
+
+        // Recording indicator — bright red dot in top-right corner.
+        if (state.recordingActive) {
+            val elapsedSec = ((recordingNowMs - recordingStartedAtMs).coerceAtLeast(0L) / 1_000L).toInt()
+            val elapsed = "%02d:%02d".format(elapsedSec / 60, elapsedSec % 60)
+            Box(
+                modifier = Modifier
+                    .fillMaxSize()
+                    .padding(top = 54.dp, end = 18.dp),
+                contentAlignment = Alignment.TopEnd,
+            ) {
+                Text(
+                    text = "● REC $elapsed",
+                    color = Color(0xFFFF3030),
+                    fontSize = 12.sp,
+                    fontWeight = FontWeight.Bold,
+                )
+            }
+        }
+
+        // Customer card — appears just under title when a known face is recognised.
+        state.customerCard?.let { card ->
+            Column(
+                modifier = Modifier
+                    .fillMaxSize()
+                    .padding(top = 140.dp, start = 24.dp, end = 24.dp),
+                horizontalAlignment = Alignment.CenterHorizontally,
+            ) {
+                Text(
+                    text = card.name,
+                    color = Color(0xFF00FF00),
+                    fontSize = 16.sp,
+                    fontWeight = FontWeight.Bold,
+                )
+                card.memoryLine?.let { mem ->
+                    Spacer(Modifier.height(2.dp))
+                    Text(
+                        text = mem,
+                        color = Color.White,
+                        fontSize = 10.sp,
+                    )
+                }
+            }
         }
     }
 }

@@ -14,6 +14,7 @@ import android.media.ImageReader
 import android.os.Handler
 import android.os.HandlerThread
 import android.util.Log
+import android.view.Surface
 import androidx.lifecycle.DefaultLifecycleObserver
 import androidx.lifecycle.LifecycleOwner
 import com.shiftmind.glasses.BuildConfig
@@ -29,17 +30,17 @@ import java.util.concurrent.atomic.AtomicLong
  *   CameraX wrapper, so `CameraSelector.DEFAULT_BACK_CAMERA` matches nothing
  *   and the analyzer never gets frames. Raw Camera2 sidesteps the validator
  *   entirely — we just open the first camera id reported by CameraManager
- *   (id "0" on Rokid RG-glasses) and stream from it. See CLAUDE.md:
- *   "If a future firmware update breaks [CameraX], fall back to raw Camera2."
+ *   (id "0" on Rokid RG-glasses) and stream from it. See CLAUDE.md.
  *
  * Pipeline:
  *   Camera2 → ImageReader (YUV_420_888, 640x480, maxImages=2)
  *     → onImageAvailable → Y/V/U → NV21 → YuvImage.compressToJpeg
  *     → PreviewClient.postFrame (multipart over OkHttp)
  *
- * Throttling: target FPS from BuildConfig.PREVIEW_FPS. Frames arriving faster
- * than the budget are dropped — we still call image.close() so the buffer
- * pool doesn't starve.
+ * Self-healing: if the camera service rejects open/createSession (usually
+ * because another client currently owns the sensor), we tear down and
+ * schedule a retry. Up to MAX_RETRIES with exponential backoff. Cancellable
+ * via stop().
  *
  * Lifecycle: `start(LifecycleOwner)` attaches a DefaultLifecycleObserver that
  * calls `stop()` on ON_DESTROY. Callers may also call stop() directly.
@@ -56,7 +57,19 @@ class CameraPreviewStreamer(
     private val frameIntervalNs: Long = (1_000_000_000.0 / targetFps).toLong()
     private val lastSentNs = AtomicLong(0L)
 
-    @Volatile private var started = false
+    @Volatile private var wantRunning = false   // user intent — drives auto-retry
+    @Volatile private var open = false          // current open attempt in flight or active
+
+    /** True while camera is open and delivering frames. False after retry exhaustion. */
+    val isActive: Boolean get() = wantRunning && open
+
+    /**
+     * Optional second output Surface (the camera-side input of the recording
+     * GL pipeline). Setting/clearing while running triggers a session
+     * recreate (Camera2 doesn't allow modifying outputs in-place pre-API 28
+     * `updateOutputConfiguration` API, which the Rokid HAL doesn't expose).
+     */
+    @Volatile private var recordingTarget: Surface? = null
 
     private var cameraThread: HandlerThread? = null
     private var cameraHandler: Handler? = null
@@ -66,43 +79,74 @@ class CameraPreviewStreamer(
     private var lifecycleObserver: DefaultLifecycleObserver? = null
     private var ownerRef: LifecycleOwner? = null
 
-    @SuppressLint("MissingPermission")
-    fun start(owner: LifecycleOwner) {
-        if (started) return
-        started = true
+    private var retryAttempt = 0
+    private var pendingRetry: Runnable? = null
 
+    fun start(owner: LifecycleOwner) {
+        if (wantRunning && open) return
+        wantRunning = true
+        retryAttempt = 0
+
+        // Observe lifecycle so we tear down on ON_DESTROY. Idempotent — if we
+        // were already attached to this owner, removeObserver is a no-op.
+        if (ownerRef !== owner) {
+            lifecycleObserver?.let { ownerRef?.lifecycle?.removeObserver(it) }
+            val obs = object : DefaultLifecycleObserver {
+                override fun onDestroy(o: LifecycleOwner) = stop()
+            }
+            ownerRef = owner
+            lifecycleObserver = obs
+            owner.lifecycle.addObserver(obs)
+        }
+
+        attemptOpen()
+    }
+
+    @SuppressLint("MissingPermission")
+    private fun attemptOpen() {
+        if (!wantRunning || open) return
         val manager = context.getSystemService(Context.CAMERA_SERVICE) as CameraManager
         val cameraId = pickCameraId(manager)
         if (cameraId == null) {
             Log.e(TAG, "no camera id available; aborting")
-            started = false
             return
         }
-        Log.i(TAG, "opening Camera2 id=$cameraId; streaming ${targetFps}fps -> ${BuildConfig.SERVER_URL}/api/preview-frame")
+        Log.i(TAG, "opening Camera2 id=$cameraId (attempt ${retryAttempt + 1}); streaming ${targetFps}fps -> ${BuildConfig.SERVER_URL}/api/preview-frame")
+        open = true
 
         cameraThread = HandlerThread("shiftmind-camera").apply { start() }
         val handler = Handler(cameraThread!!.looper).also { cameraHandler = it }
 
-        // ImageReader receives YUV frames. maxImages=2 — one in flight, one being
-        // produced. acquireLatestImage drops the older if we can't keep up.
         val reader = ImageReader.newInstance(width, height, ImageFormat.YUV_420_888, 2)
         reader.setOnImageAvailableListener({ r -> onImageAvailable(r) }, handler)
         imageReader = reader
-
-        // Observe lifecycle so we tear down on ON_DESTROY.
-        val obs = object : DefaultLifecycleObserver {
-            override fun onDestroy(o: LifecycleOwner) = stop()
-        }
-        ownerRef = owner
-        lifecycleObserver = obs
-        owner.lifecycle.addObserver(obs)
 
         try {
             manager.openCamera(cameraId, cameraStateCallback, handler)
         } catch (t: Throwable) {
             Log.e(TAG, "openCamera failed", t)
-            stopInternal()
+            handleTransientFailure()
         }
+    }
+
+    /** Tear down current open attempt and schedule another if user still wants us running. */
+    private fun handleTransientFailure() {
+        teardownCameraState()
+        if (!wantRunning) return
+        if (retryAttempt >= MAX_RETRIES) {
+            Log.w(TAG, "giving up after ${retryAttempt + 1} attempts; call start() to resume")
+            wantRunning = false
+            return
+        }
+        val delay = RETRY_DELAYS_MS[retryAttempt.coerceAtMost(RETRY_DELAYS_MS.lastIndex)]
+        retryAttempt++
+        Log.i(TAG, "scheduling retry in ${delay}ms (attempt ${retryAttempt + 1}/${MAX_RETRIES + 1})")
+        val r = Runnable {
+            pendingRetry = null
+            attemptOpen()
+        }
+        pendingRetry = r
+        retryHandler.postDelayed(r, delay)
     }
 
     /**
@@ -127,53 +171,93 @@ class CameraPreviewStreamer(
         }
 
         override fun onDisconnected(device: CameraDevice) {
-            Log.w(TAG, "camera disconnected")
-            device.close()
-            cameraDevice = null
+            // Another client grabbed the sensor. Tear down and let the
+            // foreground activity retry if the user still wants preview.
+            Log.w(TAG, "camera disconnected — releasing for the new owner")
+            handleTransientFailure()
         }
 
         override fun onError(device: CameraDevice, error: Int) {
             Log.e(TAG, "camera onError code=$error")
-            device.close()
-            cameraDevice = null
-            stopInternal()
+            handleTransientFailure()
         }
     }
 
     private fun createSession(device: CameraDevice) {
         val reader = imageReader ?: return
-        val target = reader.surface
+        val readerSurface = reader.surface
+        // Session outputs: ImageReader always; optional recording target when set.
+        // Each output of a session needs an addTarget on the CaptureRequest below.
+        val recSurface = recordingTarget
+        val outputs = if (recSurface != null) listOf(readerSurface, recSurface) else listOf(readerSurface)
         try {
             device.createCaptureSession(
-                listOf(target),
+                outputs,
                 object : CameraCaptureSession.StateCallback() {
                     override fun onConfigured(session: CameraCaptureSession) {
                         captureSession = session
                         try {
                             val req = device.createCaptureRequest(CameraDevice.TEMPLATE_PREVIEW).apply {
-                                addTarget(target)
-                                // Auto everything — preview quality is enough for face detection.
+                                addTarget(readerSurface)
+                                recSurface?.let { addTarget(it) }
                                 set(CaptureRequest.CONTROL_MODE, CaptureRequest.CONTROL_MODE_AUTO)
                                 set(CaptureRequest.CONTROL_AF_MODE, CaptureRequest.CONTROL_AF_MODE_CONTINUOUS_PICTURE)
                             }.build()
                             session.setRepeatingRequest(req, null, cameraHandler)
-                            Log.i(TAG, "capture session configured; repeating preview active")
+                            retryAttempt = 0    // successful open clears the retry counter
+                            Log.i(TAG, "capture session configured; outputs=${outputs.size}, repeating preview active")
                         } catch (t: Throwable) {
                             Log.e(TAG, "setRepeatingRequest failed", t)
-                            stopInternal()
+                            handleTransientFailure()
                         }
                     }
 
                     override fun onConfigureFailed(session: CameraCaptureSession) {
                         Log.e(TAG, "capture session configure failed")
-                        stopInternal()
+                        handleTransientFailure()
                     }
                 },
                 cameraHandler,
             )
         } catch (t: Throwable) {
             Log.e(TAG, "createCaptureSession failed", t)
-            stopInternal()
+            handleTransientFailure()
+        }
+    }
+
+    /**
+     * Attach a recording-side Surface to the camera session. Triggers a session
+     * recreate (~100-200ms). Camera2 doesn't allow modifying session outputs in
+     * place pre-API 28 `updateOutputConfiguration`, which the Rokid HAL doesn't
+     * expose, so recreating is the only path.
+     *
+     * Must be called on any thread; we hop to the cameraHandler internally.
+     */
+    fun attachRecordingTarget(surface: Surface) {
+        Log.i(TAG, "attachRecordingTarget(surface=$surface, valid=${surface.isValid})")
+        recordingTarget = surface
+        recreateSession("attach")
+    }
+
+    /** Detach the recording surface and recreate session with ImageReader only. */
+    fun detachRecordingTarget() {
+        Log.i(TAG, "detachRecordingTarget()")
+        recordingTarget = null
+        recreateSession("detach")
+    }
+
+    private fun recreateSession(reason: String) {
+        val handler = cameraHandler
+        val device = cameraDevice
+        Log.i(TAG, "recreateSession($reason): handler=${handler != null}, device=${device != null}, recTarget=${recordingTarget != null}")
+        if (handler == null || device == null) return  // not running — next start() will pick up the new target list
+        handler.post {
+            Log.i(TAG, "recreateSession($reason) dispatched: closing prev session, recreating")
+            try { captureSession?.close() } catch (t: Throwable) {
+                Log.w(TAG, "captureSession.close threw", t)
+            }
+            captureSession = null
+            createSession(device)
         }
     }
 
@@ -200,14 +284,19 @@ class CameraPreviewStreamer(
     }
 
     fun stop() {
-        stopInternal()
+        wantRunning = false
+        pendingRetry?.let { retryHandler.removeCallbacks(it) }
+        pendingRetry = null
+        retryAttempt = 0
+        teardownCameraState()
         lifecycleObserver?.let { obs -> ownerRef?.lifecycle?.removeObserver(obs) }
         lifecycleObserver = null
         ownerRef = null
     }
 
-    private fun stopInternal() {
-        started = false
+    /** Close camera+session+reader+thread but do NOT touch wantRunning/retry counters. */
+    private fun teardownCameraState() {
+        open = false
         try { captureSession?.close() } catch (_: Throwable) {}
         captureSession = null
         try { cameraDevice?.close() } catch (_: Throwable) {}
@@ -220,11 +309,8 @@ class CameraPreviewStreamer(
     }
 
     /**
-     * YUV_420_888 → JPEG via NV21. Same approach as the old CameraX path:
-     * concatenate Y, V, U as contiguous blocks. This is good enough for
-     * preview-quality JPEGs even when row/pixel strides aren't ideal; if a
-     * specific Rokid sensor produces visibly garbled frames at 640x480, the
-     * fix is to honor planes[i].rowStride / pixelStride per pixel, not here.
+     * YUV_420_888 → JPEG via NV21. Good enough for preview-quality JPEGs
+     * even when row/pixel strides aren't ideal.
      */
     private fun Image.toJpeg(quality: Int): ByteArray? {
         if (format != ImageFormat.YUV_420_888) {
@@ -258,5 +344,11 @@ class CameraPreviewStreamer(
 
     companion object {
         private const val TAG = "ShiftMind.Camera"
+        // Retry plan: 500ms, 1s, 2s, 3s, 5s — covers short camera-service
+        // handoff windows after another client releases the sensor.
+        private val RETRY_DELAYS_MS = longArrayOf(500, 1000, 2000, 3000, 5000)
+        private const val MAX_RETRIES = 5
+        // Use the main looper for the timer so we don't tie up our camera thread.
+        private val retryHandler = Handler(android.os.Looper.getMainLooper())
     }
 }

@@ -11,3 +11,23 @@ shiftmind.serverUrl=http://10.0.0.10:8000
 
 # Optional: frames per second the glasses upload to /api/preview-frame.
 shiftmind.previewFps=5
+
+# Optional: Android KeyEvent.KEYCODE that toggles AR recording.
+# Default 66 = KEYCODE_ENTER (touchpad single-tap on Rokid RG-glasses).
+#
+# DO NOT use 82 (KEYCODE_MENU) — that's the power button on Rokid, and
+# native firmware intercepts it for the photo shortcut. The press never
+# reaches the app.
+#
+# Every keycode received by MainActivity is logged at INFO under tag
+# `ShiftMind.Main`. Press a physical button, then:
+#   adb logcat -s ShiftMind.Main:V
+# Use whatever appears there. Reference:
+# developer.android.com/reference/android/view/KeyEvent
+shiftmind.recordingKey=66
+
+# Optional: extra rotation applied to the camera texture before encoding.
+# Default -90 matches the server preview rotation: raw 640x480 sensor input
+# encoded upright into 480x640. If a future Rokid model tilts the recording,
+# try 0/90/180.
+shiftmind.recordingRotation=0

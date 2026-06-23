@@ -2,7 +2,7 @@
 
 AR-glasses shared-memory retrieval system for retail workers. Rokid AR glasses surface a HUD "memory card" when a returning customer is recognized, plus live transcript triggers (product mentions, intent) during the interaction.
 
-**Status:** phase 1.5 — HUD on glasses, Camera2 streaming via USB to a FastAPI laptop server with mock face-detect and live MJPEG preview.
+**Status:** HUD on glasses, raw Camera2 live preview, built-in cam+audio recording, Rokid screenstream HUD recording, and `/pull-videos` post-processing into combined review MP4s.
 
 ## Repository layout
 
@@ -98,15 +98,15 @@ Two processes, plain HTTP, no phone middleware. Dev transport is USB-via-`adb re
 │ Compose HUD              │    POST /api/transcribe     │ Whisper STT              │
 │ AudioRecord              │ ─────────────────────────→  │ Trigger classifier       │
 │ Foreground service       │    POST /api/chat           │ VLM relay                │
-│ mix_record broadcast     │ ─────────────────────────→  │ SQLite customer DB       │
+│ cam+HUD recording        │                             │ SQLite customer DB       │
 └──────────────────────────┘                             └──────────────────────────┘
 ```
 
 See `CLAUDE.md` for design constraints + gotchas, `shiftmind-glasses/README.md` and `shiftmind-server/README.md` for module-specific details.
 
-## What's NOT in phase 1.5
+## Still Pending
 
-Glasses: ML Kit face detection, audio capture, recording broadcasts.
+Glasses: ML Kit face detection and production network settings.
 Server: real face recognition (insightface/FAISS), Whisper STT, trigger classifier, VLM relay, SQLite persistence.
 
 Phase order and per-phase deliverables: `architecture_v2.md` §"Priority order to build" in the vault.

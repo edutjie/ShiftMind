@@ -117,8 +117,9 @@ Confirm frames land on the server: open `http://localhost:8000/api/preview.html`
 | `hud/HudScreen.kt` | Title at TopCenter, BoxCursor at viewport center. No prism mirror flag (see note below). |
 | `hud/BoxCursor.kt` | Center face slot — 240dp, corner brackets + center crosshair. |
 | `ui/theme/Theme.kt` | Bright-green-on-black dark scheme. Material3 light scheme washes out on AR optics. |
-| `camera/CameraPreviewStreamer.kt` | Raw Camera2 (`CameraManager.openCamera("0", ...)`) → `ImageReader` YUV_420_888 @ 640×480 → NV21 → `YuvImage.compressToJpeg` → `PreviewClient.postFrame`. Throttled to `BuildConfig.PREVIEW_FPS`. |
+| `camera/CameraPreviewStreamer.kt` | Raw Camera2 (`CameraManager.openCamera("0", ...)`) → `ImageReader` YUV_420_888 @ 640×480 → NV21 → `YuvImage.compressToJpeg` → `PreviewClient.postFrame`. Throttled to `BuildConfig.PREVIEW_FPS`. Self-retries with backoff (500ms → 5s) on `CAMERA_IN_USE` / session-configure failures so the AR recorder can hand back the sensor cleanly. |
 | `net/PreviewClient.kt` | OkHttp wrapper for POST `/api/preview-frame`. Aggressive timeouts (1.5s connect, 2s write/read). Never throws — failures logged + counted. |
+| `recording/RecordingStateReceiver.kt` | Diagnostic listener for external Rokid `mix_record` and screenstream broadcasts. ShiftMind no longer releases camera for external recorders; it logs conflicts only. |
 
 ## Non-obvious things baked in (don't accidentally undo)
 
@@ -150,11 +151,78 @@ These three are the Rokid quirks discovered during phase 1.5; removing any one b
 | `bindToLifecycle failed` in logcat | You re-introduced CameraX (and the Rokid HAL bug). See above. |
 | Preview is rotated 90° | Sensor mounts at 270°. Server side fixes this in `api/preview.py` (`PREVIEW_ROTATE_CV2 = cv2.ROTATE_90_CLOCKWISE`). |
 
+## Recording AR video (HUD + camera) — built into ShiftMind
+
+**Phase 8.0 status:** working. Press the configured physical button (default `KEYCODE_ENTER = 66`) to start, press again to stop. ShiftMind writes two files: native camera+audio MP4 from the app, plus a HUD-only MP4 from Rokid screenstream.
+
+ShiftMind uses Camera2's multi-output capture session: the **same camera** feeds both the face-detect pipeline (ImageReader → JPEG → server) AND a recording pipeline (SurfaceTexture → GL → MediaCodec H.264 → MediaMuxer MP4). The face-detect pipeline keeps running while recording — no interruption.
+
+```
+                   ┌─→ ImageReader (640x480 YUV) → JPEG → server         (face detect)
+Camera2 session ───┤
+                   └─→ SurfaceTexture (640x480 raw) → GL copy → MediaCodec H.264 (480x640)
+                                                              → MediaMuxer cam+audio MP4
+
+Rokid screenstream broadcast ───────────────────────────────→ HUD-only MP4
+```
+
+### Use it
+
+1. Launch ShiftMind on the glasses.
+2. Press the configured button. A red `● REC` indicator appears in the HUD.
+3. Worker interaction goes here. ShiftMind continues face-detect during recording.
+4. Press the button again. Indicator clears. MP4 is finalized.
+
+### Output
+
+Cam+audio: `Movies/ShiftMind/shiftmind_YYYYMMDD_HHMMSS_cam.mp4` in MediaStore. Settings: 480x640 portrait, raw 640x480 camera input with `shiftmind.recordingRotation=0`, 24 fps, H.264 baseline @ 2 Mbps.
+
+HUD: `ScreenRecorder/ScreenRecorder_YYYYMMDDHHMMSS.mp4`, produced by Rokid's screenstream service. Pull both with `/pull-videos`; the skill auto-creates `shiftmind_<ts>_hud_keyed_opacity65.mp4` by black-keying the HUD MP4 and overlaying it over cam+audio at 65% opacity.
+
+### Picking your physical button
+
+**Don't use `KEYCODE_MENU` (82)** — on Rokid that's the **power button**, and the firmware intercepts it for the native photo shortcut before the app sees it. Symptom: pressing it takes a photo via the system camera and never reaches `dispatchKeyEvent`.
+
+Recommended: **touchpad single-tap = `KEYCODE_ENTER` (66)**. Already set as the default in `local.properties.example`.
+
+To discover other buttons, get the input-device list and live-capture events:
+```bash
+adb shell getevent -lp                                 # list input devices
+adb shell "timeout 12 getevent -lt /dev/input/event1"  # touchpad (ROKID,PSOC-TP-R)
+adb shell "timeout 12 getevent -lt /dev/input/event0"  # power button (qpnp_pon)
+```
+
+Tap each button. The lines that show up at the linux input layer (`KEY_*`) may differ from what the app sees — system shortcuts can swallow some events. Cross-check with logcat:
+```bash
+adb logcat -s ShiftMind.Main:V -v time
+```
+Every key MainActivity actually receives is logged as `keyEvent: code=NN`. Pick a keycode that appears in logcat (not just getevent) and set it:
+```properties
+shiftmind.recordingKey=66
+```
+Rebuild + reinstall.
+
+Touchpad reference (observed on RG-glasses firmware June 2026):
+
+| Linux KEY | Android keycode | Behavior |
+| :--- | :--- | :--- |
+| `KEY_ENTER` | 66 `KEYCODE_ENTER` | Single tap. Reaches app. **Use this.** |
+| `KEY_DASHBOARD` | (system) | Fires alongside ENTER; system-grabbed. Harmless when app foreground. |
+| `KEY_UP/DOWN/LEFT/RIGHT` | 19/20/21/22 | Swipe gestures. |
+| `KEY_BACK` | 4 `KEYCODE_BACK` | Long-press; closes app — avoid. |
+| `KEY_F13/F14`, `PROG1/2/3` | varies | Programmable. Test individually. |
+
+### Coexisting with external AR recorders (OverlayRec)
+
+We still listen for the Rokid `mix_record` broadcast (`com.rokid.os.master.assist.server.cmd`) in `RecordingStateReceiver`, but only **log** these events — we no longer release the camera. If the user triggers OverlayRec's AR Record while ShiftMind is running, both will fight for the camera (avoid).
+
+
+
 ## Not in this phase
 
 - ML Kit face detection (phase 2 — will hook into the existing CameraPreviewStreamer)
 - `/api/detect-face` round-trip on face-in-cursor (phase 3)
 - AudioRecord capture + `/api/transcribe` (phase 5)
-- `mix_record` recording broadcast (phase 8)
+- `mix_record` broadcast triggered FROM ShiftMind itself (we currently only listen for it — phase 8)
 
 See `../CLAUDE.md` and vault `Projects/ShiftMind/architecture_v2.md` for the full plan.

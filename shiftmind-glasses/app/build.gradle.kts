@@ -37,8 +37,20 @@ android {
         // Find your laptop IP: macOS `ipconfig getifaddr en0`, linux `hostname -I`.
         val serverUrl = localProp("shiftmind.serverUrl", "http://10.0.0.10:8000")
         val previewFps = localProp("shiftmind.previewFps", "5")
+        // KeyEvent.KEYCODE_ENTER = 66 (touchpad single-tap on Rokid RG-glasses).
+        // DO NOT default to KEYCODE_MENU (82) — that's the Rokid power button and
+        // the native photo shortcut intercepts it before the app sees it.
+        // Override with shiftmind.recordingKey=NNN in local.properties; every
+        // keycode received is logged at INFO under `ShiftMind.Main`.
+        val recordingKey = localProp("shiftmind.recordingKey", "66")
+        // Extra rotation (degrees, multiple of 90) applied to camera texture.
+        // Default -90 matches server preview: raw 640x480 sensor -> upright
+        // 480x640 recording. If future hardware differs, try 0 / 90 / 180.
+        val recordingRotation = localProp("shiftmind.recordingRotation", "-90")
         buildConfigField("String", "SERVER_URL", "\"$serverUrl\"")
         buildConfigField("int", "PREVIEW_FPS", previewFps)
+        buildConfigField("int", "RECORDING_KEY", recordingKey)
+        buildConfigField("int", "RECORDING_ROTATION_DEG", recordingRotation)
     }
 
     buildTypes {
@@ -89,11 +101,6 @@ dependencies {
     implementation(libs.androidx.ui.tooling.preview)
     implementation(libs.androidx.material3)
     debugImplementation(libs.androidx.ui.tooling)
-
-    // CameraX: ImageAnalysis use case captures YUV frames in a background thread.
-    implementation(libs.androidx.camera.core)
-    implementation(libs.androidx.camera.camera2)
-    implementation(libs.androidx.camera.lifecycle)
 
     // OkHttp: streaming JPEGs to the laptop preview endpoint.
     implementation(libs.okhttp)

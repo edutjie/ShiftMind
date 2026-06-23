@@ -13,10 +13,12 @@ import androidx.core.app.NotificationCompat
 /**
  * Foreground service that keeps ShiftMind alive across Activity lifecycle.
  *
- * Phase 1 only owns the wake lock + notification — Camera2, audio capture,
- * and the HTTP client land in later phases. The foregroundServiceType flags
- * passed to startForeground() must match the manifest declaration, or
- * Android 14+ throws ForegroundServiceTypeException at start.
+ * Phase-1 baseline: just a wake-lock + CONNECTED_DEVICE foreground type so
+ * Android doesn't kill us while the activity is briefly backgrounded (e.g.
+ * during permission dialogs). Camera ownership stays with [MainActivity].
+ *
+ * HUD recording is driven via [RokidHudRecorder]'s screenstream broadcast,
+ * which runs outside this app's process and does not need its own FGS.
  */
 class GlassesService : Service() {
 
@@ -31,12 +33,10 @@ class GlassesService : Service() {
     }
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
-        // Phase 1 uses only CONNECTED_DEVICE — it has no runtime-permission
-        // gate. Adding CAMERA or MICROPHONE here on Android 14 throws
-        // SecurityException unless the matching runtime permission is already
-        // granted at this exact moment. The activity owns the camera while
-        // foreground; once we move camera ownership into the service (phase
-        // 5+ for audio), we can OR in the additional type flags.
+        // CONNECTED_DEVICE only — Android 14 won't grant CAMERA / MICROPHONE
+        // foreground types here without the matching runtime perms being
+        // confirmed at startForeground() time, and we don't need them anyway:
+        // the activity owns the camera while in the foreground.
         startForeground(
             NOTIFICATION_ID,
             buildNotification(),
@@ -50,7 +50,6 @@ class GlassesService : Service() {
     override fun onDestroy() {
         wakeLock?.takeIf { it.isHeld }?.release()
         wakeLock = null
-        // stopForeground is implicit on destroy, but be explicit for clarity.
         stopForeground(STOP_FOREGROUND_REMOVE)
         super.onDestroy()
     }

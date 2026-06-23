@@ -14,6 +14,17 @@ uv sync
 ## Run
 
 ```bash
+./run.sh
+```
+
+Wrapper that runs `adb reverse tcp:8000 tcp:8000` (so the glasses can reach the laptop at `127.0.0.1:8000` over USB) and then starts uvicorn with `--reload`. Tunnel is torn down on Ctrl+C.
+
+Overrides via env: `PORT=9000 ./run.sh`, `NO_RELOAD=1 ./run.sh`, `NO_ADB=1 ./run.sh` (skip tunnel — e.g. when running over WiFi).
+
+Manual equivalent if you don't want the wrapper:
+
+```bash
+adb reverse tcp:8000 tcp:8000          # so glasses can hit 127.0.0.1:8000
 uv run uvicorn server:app --host 0.0.0.0 --port 8000 --reload
 ```
 

@@ -14,7 +14,7 @@ import java.util.concurrent.TimeUnit
  * Minimal OkHttp wrapper for POST /api/preview-frame.
  *
  * Phase-1.5 scope: blocking calls on whatever thread invokes postFrame(). The
- * caller (CameraPreviewStreamer) runs us off the CameraX analyzer executor,
+ * caller (CameraPreviewStreamer) runs us off the Camera2 handler thread,
  * so this never blocks the UI thread.
  *
  * Logs network failures at WARN but never throws — preview is best-effort

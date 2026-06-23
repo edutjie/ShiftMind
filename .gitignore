@@ -17,3 +17,5 @@ Thumbs.db
 .env.local
 scratch/
 tmp/
+# Pulled MP4s from glasses — too large to commit.
+recordings/
