@@ -10,10 +10,13 @@ dependencies = [
     "opencv-python>=4.10",
     "numpy>=2.0",
     "requests>=2.32",
+    "insightface>=0.7.3",
+    "onnxruntime>=1.18",
+    "pymilvus[milvus_lite]>=2.5",
 ]
 
 [tool.uv]
 package = false
 
 # Heavy ML deps deferred to phase 3+:
-#   uv add insightface faiss-cpu openai-whisper ultralytics
+#   uv add openai-whisper ultralytics

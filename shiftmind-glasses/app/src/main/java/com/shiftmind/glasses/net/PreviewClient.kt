@@ -2,11 +2,14 @@ package com.shiftmind.glasses.net
 
 import android.util.Log
 import com.shiftmind.glasses.BuildConfig
+import com.shiftmind.glasses.hud.CustomerCard
+import com.shiftmind.glasses.hud.HudStateHolder
 import okhttp3.MediaType.Companion.toMediaType
 import okhttp3.MultipartBody
 import okhttp3.OkHttpClient
 import okhttp3.Request
 import okhttp3.RequestBody.Companion.toRequestBody
+import org.json.JSONObject
 import java.io.IOException
 import java.util.concurrent.TimeUnit
 
@@ -62,6 +65,7 @@ class PreviewClient(private val baseUrl: String = BuildConfig.SERVER_URL) {
         return try {
             client.newCall(req).execute().use { resp ->
                 if (resp.isSuccessful) {
+                    resp.body?.string()?.let { applyRecognitionResponse(it) }
                     if (consecutiveErrors > 0) {
                         Log.i(TAG, "preview pipeline recovered after $consecutiveErrors errors")
                         consecutiveErrors = 0
@@ -75,6 +79,44 @@ class PreviewClient(private val baseUrl: String = BuildConfig.SERVER_URL) {
         } catch (e: IOException) {
             bumpError(e.message ?: e.javaClass.simpleName)
             false
+        }
+    }
+
+    private fun applyRecognitionResponse(body: String) {
+        val recognition = runCatching {
+            JSONObject(body).optJSONObject("recognition")
+        }.getOrNull() ?: return
+        when (recognition.optString("recognition_status")) {
+            "confirmed" -> {
+                val personId = recognition.optString("person_id")
+                val name = recognition.optString("name").ifBlank { personId.ifBlank { "known customer" } }
+                val summary = recognition.optString("summary").ifBlank { "Dummy summary: returning customer." }
+                HudStateHolder.mutate {
+                    it.copy(
+                        statusLine = "confirmed $personId".trim(),
+                        customerCard = CustomerCard(
+                            name = name,
+                            lastVisit = null,
+                            memoryLine = summary,
+                        ),
+                    )
+                }
+            }
+            "unrecognized_first_visit" -> {
+                HudStateHolder.mutate {
+                    it.copy(
+                        statusLine = "unrecognized, first visit",
+                        customerCard = CustomerCard(
+                            name = "First visit",
+                            lastVisit = null,
+                            memoryLine = "unrecognized, first visit",
+                        ),
+                    )
+                }
+            }
+            "candidate", "searching" -> {
+                HudStateHolder.mutate { it.copy(statusLine = "recognizing", customerCard = null) }
+            }
         }
     }
 

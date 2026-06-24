@@ -27,7 +27,8 @@ from fastapi import APIRouter, File, Form, UploadFile
 from fastapi.responses import HTMLResponse, StreamingResponse
 from pydantic import BaseModel, Field
 
-from state import latest_face_crop, latest_frame, latest_hud_state
+from face_recognition_service import get_face_service, normalize_face_crop_jpeg
+from state import latest_face_crop, latest_frame, latest_hud_state, latest_recognition_state
 
 router = APIRouter()
 
@@ -109,6 +110,22 @@ def _draw_hud_overlay(img: np.ndarray) -> None:
     state, _, _ = latest_hud_state.read()
     if not state:
         state = {"title": "ShiftMind", "statusLine": "awaiting customer", "recordingActive": False}
+    recog, _, _ = latest_recognition_state.read()
+    if recog.get("recognition_status") in {"confirmed", "unrecognized_first_visit"}:
+        state = dict(state)
+        if recog.get("recognition_status") == "confirmed":
+            person_id = str(recog.get("person_id") or "")
+            state["statusLine"] = f"confirmed {person_id}".strip()
+            state["customerCard"] = {
+                "name": recog.get("name") or person_id or "known customer",
+                "memoryLine": recog.get("summary") or "Dummy summary: returning customer.",
+            }
+        else:
+            state["statusLine"] = "unrecognized, first visit"
+            state["customerCard"] = {
+                "name": "First visit",
+                "memoryLine": "unrecognized, first visit",
+            }
 
     h, w = img.shape[:2]
     green = (0, 255, 0)
@@ -223,9 +240,19 @@ async def preview_frame(
         return {"received": False, "reason": "empty"}
     latest_frame.write(jpeg)
     face_bytes = await face_crop.read() if face_crop is not None else b""
+    recognition = None
     if face_bytes:
+        face_bytes = normalize_face_crop_jpeg(face_bytes)
         latest_face_crop.write(face_bytes, face_box)
-    return {"received": True, "bytes": len(jpeg), "face_crop": bool(face_bytes)}
+        result = await asyncio.to_thread(get_face_service().recognize, face_bytes)
+        recognition = result.to_dict()
+        latest_recognition_state.write(recognition)
+    return {
+        "received": True,
+        "bytes": len(jpeg),
+        "face_crop": bool(face_bytes),
+        "recognition": recognition or latest_recognition_state.read()[0],
+    }
 
 
 @router.post("/api/hud-state")
@@ -240,6 +267,7 @@ async def preview_status() -> dict:
     jpeg, ts, seq = latest_frame.read()
     hud, hud_ts, hud_seq = latest_hud_state.read()
     face, face_box, face_ts, face_seq = latest_face_crop.read()
+    recognition, recognition_ts, recognition_seq = latest_recognition_state.read()
     return {
         "have_frame": jpeg is not None,
         "seq": seq,
@@ -251,6 +279,9 @@ async def preview_status() -> dict:
         "face_seq": face_seq,
         "face_box": face_box,
         "face_age_seconds": (time.monotonic() - face_ts) if face is not None else None,
+        "recognition_seq": recognition_seq,
+        "recognition_age_seconds": (time.monotonic() - recognition_ts) if recognition_ts else None,
+        **recognition,
     }
 
 
@@ -288,18 +319,9 @@ async def _face_crop_generator():
         if jpeg is None:
             yield _mjpeg_chunk(_PLACEHOLDER_JPEG)
         elif seq != last_seq:
-            yield _mjpeg_chunk(_rotate_face_crop_jpeg(jpeg))
+            yield _mjpeg_chunk(jpeg)
             last_seq = seq
         await asyncio.sleep(FRAME_INTERVAL)
-
-
-def _rotate_face_crop_jpeg(jpeg: bytes) -> bytes:
-    arr = np.frombuffer(jpeg, dtype=np.uint8)
-    img = cv2.imdecode(arr, cv2.IMREAD_COLOR)
-    if img is None:
-        return jpeg
-    rotated = cv2.rotate(img, cv2.ROTATE_90_COUNTERCLOCKWISE)
-    return _encode_jpeg(rotated) or jpeg
 
 
 @router.get("/api/preview")
@@ -341,6 +363,6 @@ img{max-width:100%;height:auto;border:1px solid #0f0}
   <section><strong>HUD preview</strong><img src="/api/preview-hud" alt="live MJPEG stream with HUD" /></section>
   <section><strong>face crop</strong><img class="face" src="/api/preview-face" alt="latest detected face crop" /></section>
 </main>
-<p><a href="/api/preview">raw preview</a> · POST JPEGs to <code>/api/preview-frame</code> and HUD JSON to <code>/api/hud-state</code>.</p>
+<p><a href="/api/preview">raw preview</a> · <a href="/api/faces.html">faces debug</a> · POST JPEGs to <code>/api/preview-frame</code> and HUD JSON to <code>/api/hud-state</code>.</p>
 </body></html>"""
     return HTMLResponse(html)

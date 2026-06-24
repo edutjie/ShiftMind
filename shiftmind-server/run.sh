@@ -9,7 +9,7 @@
 #   ./run.sh all              # same as above
 #   ./run.sh server           # uvicorn only (still honors adb unless NO_ADB=1)
 #   PORT=9000 ./run.sh        # override port (both tunnel + uvicorn)
-#   NO_RELOAD=1 ./run.sh      # disable autoreload
+#   RELOAD=1 ./run.sh         # enable autoreload (off by default; Milvus Lite locks local DB)
 #   NO_ADB=1 ./run.sh         # skip adb reverse (e.g. running over WiFi)
 #   OPEN_PREVIEW=1 ./run.sh   # open /api/preview.html after server starts
 #   WEBCAM=1 ./run.sh         # also feed laptop webcam into /api/preview-frame
@@ -87,8 +87,8 @@ cleanup() {
 trap cleanup EXIT INT TERM
 
 # ── processes ─────────────────────────────────────────────────────────────
-reload_flag="--reload"
-[[ -n "${NO_RELOAD:-}" ]] && reload_flag=""
+reload_flag=""
+[[ -n "${RELOAD:-}" ]] && reload_flag="--reload"
 
 echo "[run.sh] starting uvicorn on ${HOST}:${PORT}${reload_flag:+ (reload)}"
 uv run uvicorn server:app --host "$HOST" --port "$PORT" $reload_flag &

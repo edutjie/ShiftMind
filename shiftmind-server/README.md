@@ -1,6 +1,8 @@
 # shiftmind-server
 
-Laptop FastAPI backend for ShiftMind. Phase 1: health endpoint, mock face-detect, live MJPEG preview of frames the glasses send.
+Laptop FastAPI backend for ShiftMind. Current dev server: health endpoint,
+live MJPEG preview, ML Kit face-crop ingestion, InsightFace `buffalo_l`
+recognition, SQLite customer storage, and Milvus Lite embedding search.
 
 ## Setup
 
@@ -17,15 +19,18 @@ uv sync
 ./run.sh
 ```
 
-Wrapper that runs `adb reverse tcp:8000 tcp:8000` (so the glasses can reach the laptop at `127.0.0.1:8000` over USB) and then starts uvicorn with `--reload`. Tunnel is torn down on Ctrl+C.
+Wrapper that runs `adb reverse tcp:8000 tcp:8000` (so the glasses can reach the laptop at `127.0.0.1:8000` over USB) and then starts uvicorn. Tunnel is torn down on Ctrl+C.
 
-Overrides via env: `PORT=9000 ./run.sh`, `NO_RELOAD=1 ./run.sh`, `NO_ADB=1 ./run.sh` (skip tunnel — e.g. when running over WiFi).
+Overrides via env: `PORT=9000 ./run.sh`, `RELOAD=1 ./run.sh`, `NO_ADB=1 ./run.sh` (skip tunnel — e.g. when running over WiFi).
+
+`RELOAD=1` is off by default because Milvus Lite uses a local DB file lock;
+uvicorn reload can briefly overlap processes and trigger `DataDirLockedError`.
 
 Manual equivalent if you don't want the wrapper:
 
 ```bash
 adb reverse tcp:8000 tcp:8000          # so glasses can hit 127.0.0.1:8000
-uv run uvicorn server:app --host 0.0.0.0 --port 8000 --reload
+uv run uvicorn server:app --host 0.0.0.0 --port 8000
 ```
 
 Binds `0.0.0.0` so the glasses (or any device on the same WiFi) can reach it. Local dev only — no auth.
@@ -35,11 +40,29 @@ Binds `0.0.0.0` so the glasses (or any device on the same WiFi) can reach it. Lo
 | Endpoint | Method | Purpose |
 | :--- | :--- | :--- |
 | `/api/health` | GET | Liveness check. Returns `{"status":"ok","version":"0.1.0"}`. |
-| `/api/detect-face` | POST | Multipart `image=<jpeg>`. Phase-1 mock: returns a fixed known customer, or a new-customer payload when header `X-Mock-New: 1` is set. |
-| `/api/preview-frame` | POST | Dev-only. Multipart `image=<jpeg>`. Writes to the in-memory slot the MJPEG stream reads from. |
+| `/api/detect-face` | POST | Multipart `image=<jpeg>`. Runs InsightFace `buffalo_l`, searches Milvus Lite, and returns current vote/recognition state. |
+| `/api/enroll-face` | POST | Debug endpoint. Form `person_id`, `name`, `memory_card`; embeds latest face crop and stores customer in SQLite + Milvus Lite. |
+| `/api/faces.html` | GET | Debug page for latest face crop, vote state, customers, Milvus count, and enrollment. |
+| `/api/preview-frame` | POST | Dev-only. Multipart `image=<jpeg>` plus optional `face_crop=<jpeg>`. Stores preview frame and recognizes face crops. |
 | `/api/preview` | GET | Live MJPEG stream (`multipart/x-mixed-replace`). Rotated 90° clockwise to compensate for the Rokid 270° sensor mount — see `PREVIEW_ROTATE_CV2` in `api/preview.py`. Open in any browser. |
-| `/api/preview.html` | GET | Convenience page: tiny `<img>` wrapping `/api/preview`. |
-| `/api/preview-status` | GET | `{have_frame, seq, age_seconds}`. |
+| `/api/preview-face` | GET | Live MJPEG stream of the latest face crop. |
+| `/api/preview.html` | GET | Convenience page showing HUD preview + latest face crop. |
+| `/api/preview-status` | GET | Preview, face crop, and recognition status JSON. |
+
+## Face recognition dev flow
+
+1. Launch server with `./run.sh`.
+2. Open `http://localhost:8000/api/preview.html`.
+3. Align a face inside the glasses cursor until the face crop appears.
+4. Open `http://localhost:8000/api/faces.html`.
+5. Enroll the latest crop with `person_id`, `name`, and `memory_card`.
+6. Re-show the same face. Recognition confirms after 3 of the last 5 valid crops.
+
+Data lives under `shiftmind-server/data/` and is gitignored:
+
+- `shiftmind.sqlite3` — customers, face images, recognition events.
+- `milvus/shiftmind.db` — Milvus Lite vector store.
+- `faces/*.jpg` — saved enrollment crops.
 
 ## Dev tool — feed webcam into the preview pipeline
 
@@ -62,7 +85,6 @@ uv run uvicorn server:app --host 0.0.0.0 --port 8000
 # in another
 curl http://localhost:8000/api/health
 curl -X POST -F "image=@/some/photo.jpg" http://localhost:8000/api/detect-face
-curl -X POST -H "X-Mock-New: 1" -F "image=@/some/photo.jpg" http://localhost:8000/api/detect-face
 curl http://localhost:8000/api/preview-status
 
 # preview
@@ -72,7 +94,6 @@ open http://localhost:8000/api/preview.html      # macOS; or paste into browser
 
 ## What's NOT here yet
 
-- Real face recognition (insightface + FAISS) — phase 3
 - Audio STT (Whisper) — phase 5
 - Trigger classifier — phase 6
 - Conversation persistence (SQLite) — phase 7

@@ -18,7 +18,6 @@ import android.view.Surface
 import androidx.lifecycle.DefaultLifecycleObserver
 import androidx.lifecycle.LifecycleOwner
 import com.shiftmind.glasses.BuildConfig
-import com.shiftmind.glasses.hud.CustomerCard
 import com.shiftmind.glasses.hud.HudStateHolder
 import com.shiftmind.glasses.net.PreviewClient
 import java.io.ByteArrayOutputStream
@@ -372,8 +371,8 @@ class CameraPreviewStreamer(
             latestFaceBoxJson = faceBox.toJson()
             HudStateHolder.mutate {
                 it.copy(
-                    statusLine = "face aligned",
-                    customerCard = DUMMY_CUSTOMER,
+                    statusLine = "recognizing",
+                    customerCard = null,
                 )
             }
         } else {
@@ -393,12 +392,6 @@ class CameraPreviewStreamer(
 
     companion object {
         private const val TAG = "ShiftMind.Camera"
-        private val DUMMY_CUSTOMER = CustomerCard(
-            name = "MeiXi",
-            lastVisit = "2026-06-18",
-            memoryLine = "Dummy profile: prefers lightweight jackets",
-            preferences = listOf("neutral colors", "size M"),
-        )
         // Retry plan: 500ms, 1s, 2s, 3s, 5s — covers short camera-service
         // handoff windows after another client releases the sensor.
         private val RETRY_DELAYS_MS = longArrayOf(500, 1000, 2000, 3000, 5000)

@@ -84,3 +84,26 @@ class LatestHudState:
 
 
 latest_hud_state = LatestHudState()
+
+
+@dataclass
+class LatestRecognitionState:
+    """Latest server-side face recognition result."""
+
+    _lock: threading.Lock = field(default_factory=threading.Lock)
+    _state: dict[str, Any] = field(default_factory=lambda: {"recognition_status": "idle"})
+    _ts: float = 0.0
+    _seq: int = 0
+
+    def write(self, state: dict[str, Any]) -> None:
+        with self._lock:
+            self._state = state
+            self._ts = time.monotonic()
+            self._seq += 1
+
+    def read(self) -> tuple[dict[str, Any], float, int]:
+        with self._lock:
+            return self._state, self._ts, self._seq
+
+
+latest_recognition_state = LatestRecognitionState()

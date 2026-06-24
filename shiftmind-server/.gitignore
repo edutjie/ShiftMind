@@ -9,6 +9,7 @@ __pycache__/
 .venv/
 venv/
 env/
+data/
 
 # DO commit:
 #   pyproject.toml  — dependency manifest

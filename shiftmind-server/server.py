@@ -1,17 +1,18 @@
 """ShiftMind FastAPI server — entrypoint.
 
 Run:
-    uv run uvicorn server:app --host 0.0.0.0 --port 8000 --reload
+    uv run uvicorn server:app --host 0.0.0.0 --port 8000
 """
 from __future__ import annotations
 
 from fastapi import FastAPI
 
-from api import detect_face, health, preview
+from api import detect_face, faces, health, preview
 
 app = FastAPI(title="ShiftMind server", version="0.1.0")
 app.include_router(health.router)
 app.include_router(detect_face.router)
+app.include_router(faces.router)
 app.include_router(preview.router)
 
 
@@ -23,6 +24,8 @@ async def root() -> dict:
         "endpoints": [
             "/api/health",
             "/api/detect-face",
+            "/api/enroll-face",
+            "/api/faces.html",
             "/api/preview",
             "/api/preview-face",
             "/api/preview-hud",
@@ -37,4 +40,4 @@ async def root() -> dict:
 if __name__ == "__main__":
     import uvicorn
 
-    uvicorn.run("server:app", host="0.0.0.0", port=8000, reload=True)
+    uvicorn.run("server:app", host="0.0.0.0", port=8000, reload=False)
