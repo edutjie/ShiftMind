@@ -13,7 +13,7 @@ Pulls ShiftMind recording pairs off the Rokid glasses into the repo's `recording
 
 Filenames don't share a basename — Rokid names its own file with its own clock (~+1s offset). Pair by wall-clock time.
 
-Combined output uses the cam+audio MP4 as base and overlays the HUD screen MP4 after black-keying its background. HUD opacity is `65%` so the AR UI remains readable without washing out the camera view:
+Combined output uses the cam+audio MP4 as base and overlays the HUD screen MP4 after black-keying its background. HUD opacity is `65%` so the AR UI remains readable without washing out the camera view. Rokid screenstream usually starts before the cam recorder, so combine trims the first `3s` from the HUD by default (`HUD_TRIM_SECONDS=<seconds>` overrides it).
 
 - **combined:** `recordings/shiftmind_<ts>_hud_keyed_opacity65.mp4`
 
@@ -70,6 +70,7 @@ And a one-line summary: `pulled 2 file(s), combined 1 pair(s) → recordings/` o
 - Use `adb pull` not `adb shell cat` — `pull` preserves mtime and is binary-safe.
 - Recordings stay on glasses; this skill is the only way to get them to laptop (over-HTTP upload is too expensive per [project AGENTS.md](../../AGENTS.md)).
 - If the latest cam file is `<10KB` it's likely a corrupt session (camera didn't reach `outputs=2`). Warn but pull anyway.
+- If a cam MP4 has broken timestamp metadata (format duration far longer than stream duration), rewrite it through FFmpeg into a temp file with video/audio PTS reset, then replace the local copy. This keeps the local `*_cam.mp4` playable.
 - HUD file under `~50KB` warns: screenstream may have stopped early.
 - Requires `ffmpeg` for auto-combine. If missing, pull still succeeds and prints `ffmpeg not found — skipped combine`.
 - Combine command:
@@ -78,7 +79,7 @@ And a one-line summary: `pulled 2 file(s), combined 1 pair(s) → recordings/` o
 ffmpeg -y \
   -i "$cam_path" \
   -i "$hud_path" \
-  -filter_complex "[0:v]setpts=PTS-STARTPTS,format=rgba[cam];[1:v]setpts=PTS-STARTPTS,scale=480:640,format=rgba,colorkey=0x000000:0.08:0.04,colorchannelmixer=aa=0.65[hud];[cam][hud]overlay=0:0:format=auto:shortest=1,format=yuv420p[v];[0:a]apad[a]" \
+  -filter_complex "[0:v]setpts=PTS-STARTPTS,format=rgba[cam];[1:v]trim=start=3,setpts=PTS-STARTPTS,scale=480:640,format=rgba,colorkey=0x000000:0.08:0.04,colorchannelmixer=aa=0.65[hud];[cam][hud]overlay=0:0:format=auto:shortest=1,format=yuv420p[v];[0:a]asetpts=PTS-STARTPTS,apad[a]" \
   -map "[v]" -map "[a]" \
   -c:v libx264 -preset medium -crf 18 \
   -c:a aac -b:a 48k -shortest \
@@ -121,9 +122,72 @@ pull_one() {
   pulled_count=$((pulled_count + 1))
 }
 
+probe_duration() {
+  local path="$1" selector="${2:-format}"
+  if ! command -v ffprobe >/dev/null 2>&1; then
+    echo 0
+    return
+  fi
+  case "$selector" in
+    video)
+      ffprobe -v error -select_streams v:0 -show_entries stream=duration \
+        -of default=nokey=1:noprint_wrappers=1 "$path" 2>/dev/null | head -1
+      ;;
+    audio)
+      ffprobe -v error -select_streams a:0 -show_entries stream=duration \
+        -of default=nokey=1:noprint_wrappers=1 "$path" 2>/dev/null | head -1
+      ;;
+    *)
+      ffprobe -v error -show_entries format=duration \
+        -of default=nokey=1:noprint_wrappers=1 "$path" 2>/dev/null | head -1
+      ;;
+  esac | awk 'NF {print $1; found=1} END {if (!found) print 0}'
+}
+
+repair_cam_if_needed() {
+  local cam_path="$1"
+  [[ "$(basename "$cam_path")" == shiftmind_*_cam.mp4 ]] || return
+  command -v ffmpeg >/dev/null 2>&1 || return
+  command -v python3 >/dev/null 2>&1 || return
+
+  local fmt_dur video_dur audio_dur needs_repair
+  fmt_dur="$(probe_duration "$cam_path" format)"
+  video_dur="$(probe_duration "$cam_path" video)"
+  audio_dur="$(probe_duration "$cam_path" audio)"
+  needs_repair="$(python3 - "$fmt_dur" "$video_dur" "$audio_dur" <<'PY'
+import sys
+fmt, video, audio = (float(x or 0) for x in sys.argv[1:4])
+stream_max = max(video, audio)
+print("yes" if stream_max > 0 and fmt > stream_max + 5 else "no")
+PY
+)"
+  [ "$needs_repair" = "yes" ] || return
+
+  local backup="${cam_path%.mp4}.rawpts.mp4"
+  local tmp="${cam_path%.mp4}.repaired.tmp.mp4"
+  [ -f "$backup" ] || cp "$cam_path" "$backup"
+  ffmpeg -y \
+    -i "$cam_path" \
+    -filter_complex "[0:v]setpts=PTS-STARTPTS[v];[0:a]asetpts=PTS-STARTPTS,apad[a]" \
+    -map "[v]" -map "[a]" \
+    -c:v libx264 -preset medium -crf 18 \
+    -c:a aac -b:a 48k -shortest \
+    "$tmp" >/dev/null 2>&1
+  local repaired_video_dur
+  repaired_video_dur="$(probe_duration "$tmp" video)"
+  python3 - "$video_dur" "$repaired_video_dur" <<'PY'
+import sys
+before = float(sys.argv[1] or 0)
+after = float(sys.argv[2] or 0)
+raise SystemExit(0 if after + 0.5 >= before else 1)
+PY
+  mv "$tmp" "$cam_path"
+  echo "✓ $(basename "$cam_path") repaired timestamps"
+}
+
 combine_pair() {
   local cam_path="$1" hud_path="$2"
-  local cam_name out_name out_path
+  local cam_name out_name out_path hud_trim
   cam_name="$(basename "$cam_path")"
   out_name="${cam_name/_cam.mp4/_hud_keyed_opacity65.mp4}"
   out_path="$DEST/$out_name"
@@ -136,17 +200,19 @@ combine_pair() {
     echo "= $out_name (already combined)"
     return
   fi
+  repair_cam_if_needed "$cam_path"
+  hud_trim="${HUD_TRIM_SECONDS:-3}"
 
   ffmpeg -y \
     -i "$cam_path" \
     -i "$hud_path" \
-    -filter_complex "[0:v]setpts=PTS-STARTPTS,format=rgba[cam];[1:v]setpts=PTS-STARTPTS,scale=480:640,format=rgba,colorkey=0x000000:0.08:0.04,colorchannelmixer=aa=0.65[hud];[cam][hud]overlay=0:0:format=auto:shortest=1,format=yuv420p[v];[0:a]apad[a]" \
+    -filter_complex "[0:v]setpts=PTS-STARTPTS,format=rgba[cam];[1:v]trim=start=${hud_trim},setpts=PTS-STARTPTS,scale=480:640,format=rgba,colorkey=0x000000:0.08:0.04,colorchannelmixer=aa=0.65[hud];[cam][hud]overlay=0:0:format=auto:shortest=1,format=yuv420p[v];[0:a]asetpts=PTS-STARTPTS,apad[a]" \
     -map "[v]" -map "[a]" \
     -c:v libx264 -preset medium -crf 18 \
     -c:a aac -b:a 48k -shortest \
     "$out_path" >/dev/null 2>&1
 
-  printf '✓ %-44s combined HUD@65%%\n' "$out_name"
+  printf '✓ %-44s combined HUD@65%% (HUD trim %ss)\n' "$out_name" "$hud_trim"
   combined_count=$((combined_count + 1))
 }
 
