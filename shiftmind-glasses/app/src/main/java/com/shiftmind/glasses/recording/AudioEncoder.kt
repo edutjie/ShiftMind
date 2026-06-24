@@ -30,10 +30,8 @@ import java.nio.ByteBuffer
  *   3. Re-post self.
  *
  * PTS: derived from cumulative sample count, not wall-clock — keeps audio
- * monotonic and gives MediaMuxer a sane sample timing even if reads are
- * jittery. Track timeline matches camera SurfaceTexture.timestamp closely
- * enough for sub-frame sync (camera PTS is system-monotonic-ns; we anchor
- * audio PTS to the same epoch on [start]).
+ * monotonic and prevents the first blocking AudioRecord.read() from pushing
+ * the whole audio track later in the MP4 timeline.
  */
 class AudioEncoder(
     private val muxer: RecordingMuxer,
@@ -61,7 +59,12 @@ class AudioEncoder(
     @Volatile private var stopRequested = false
     @Volatile private var draining = false
 
-    /** PTS anchor — System.nanoTime() at start. Audio PTS = anchor + (samples * 1e6 / sampleRate). */
+    /**
+     * Shared session anchor kept for logging/API symmetry with video. Audio
+     * sample times are rebased to zero from [totalFramesRead]; using wall-clock
+     * after a blocking read delays the first AAC packet by the mic/codec warmup
+     * time (often ~150-200ms on Rokid).
+     */
     private var startEpochNs: Long = 0L
     private var totalFramesRead: Long = 0L
 
@@ -260,10 +263,7 @@ class AudioEncoder(
     }
 
     private fun computePtsUs(): Long {
-        // PTS = nanos since start, in micros. We anchor to startEpochNs so
-        // audio + video share the same monotonic timeline (camera SurfaceTexture
-        // timestamp is also System.nanoTime-based on Android).
-        return (System.nanoTime() - startEpochNs) / 1_000L
+        return totalFramesRead * 1_000_000L / sampleRate
     }
 
     private fun drainOutput() {

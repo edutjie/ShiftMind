@@ -75,6 +75,9 @@ class RecordingMuxer(
     @Volatile private var started: Boolean = false
     @Volatile private var finalized: Boolean = false
 
+    private val pendingVideoSamples = ArrayDeque<PendingSample>()
+    private val pendingAudioSamples = ArrayDeque<PendingSample>()
+
     /** Set BEFORE [open] to indicate audio track will be added. */
     fun setAudioEnabled(enabled: Boolean) { audioEnabled = enabled }
 
@@ -124,18 +127,56 @@ class RecordingMuxer(
         muxer!!.start()
         started = true
         Log.i(TAG, "muxer started (video=$videoTrackIndex audio=$audioTrackIndex)")
+        flushPendingSamples()
     }
 
-    /** Thread-safe video write. No-op if muxer not started yet. */
+    /** Thread-safe video write. Buffers early codec output until muxer starts. */
     fun writeVideo(buffer: ByteBuffer, info: android.media.MediaCodec.BufferInfo) = lock.withLock {
-        if (!started || finalized) return@withLock
+        if (finalized) return@withLock
+        if (!started) {
+            pendingVideoSamples.addLast(copySample(buffer, info))
+            return@withLock
+        }
         muxer!!.writeSampleData(videoTrackIndex, buffer, info)
     }
 
-    /** Thread-safe audio write. No-op if muxer not started yet. */
+    /** Thread-safe audio write. Buffers early codec output until muxer starts. */
     fun writeAudio(buffer: ByteBuffer, info: android.media.MediaCodec.BufferInfo) = lock.withLock {
-        if (!started || finalized) return@withLock
+        if (finalized) return@withLock
+        if (!started) {
+            pendingAudioSamples.addLast(copySample(buffer, info))
+            return@withLock
+        }
         muxer!!.writeSampleData(audioTrackIndex, buffer, info)
+    }
+
+    private fun copySample(
+        buffer: ByteBuffer,
+        info: android.media.MediaCodec.BufferInfo,
+    ): PendingSample {
+        val bytes = ByteArray(info.size)
+        val oldPosition = buffer.position()
+        val oldLimit = buffer.limit()
+        buffer.position(info.offset)
+        buffer.limit(info.offset + info.size)
+        buffer.get(bytes)
+        buffer.position(oldPosition)
+        buffer.limit(oldLimit)
+        val copyInfo = android.media.MediaCodec.BufferInfo().apply {
+            set(0, bytes.size, info.presentationTimeUs, info.flags)
+        }
+        return PendingSample(bytes, copyInfo)
+    }
+
+    private fun flushPendingSamples() {
+        while (pendingVideoSamples.isNotEmpty()) {
+            val sample = pendingVideoSamples.removeFirst()
+            muxer!!.writeSampleData(videoTrackIndex, ByteBuffer.wrap(sample.bytes), sample.info)
+        }
+        while (pendingAudioSamples.isNotEmpty()) {
+            val sample = pendingAudioSamples.removeFirst()
+            muxer!!.writeSampleData(audioTrackIndex, ByteBuffer.wrap(sample.bytes), sample.info)
+        }
     }
 
     /**
@@ -152,6 +193,8 @@ class RecordingMuxer(
         }
         try { muxer?.release() } catch (_: Throwable) {}
         muxer = null
+        pendingVideoSamples.clear()
+        pendingAudioSamples.clear()
         try { pfd?.close() } catch (_: Throwable) {}
         pfd = null
         publishToMediaStore()
@@ -200,4 +243,9 @@ class RecordingMuxer(
     companion object {
         private const val TAG = "ShiftMind.Muxer"
     }
+
+    private data class PendingSample(
+        val bytes: ByteArray,
+        val info: android.media.MediaCodec.BufferInfo,
+    )
 }
