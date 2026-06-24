@@ -104,4 +104,7 @@ dependencies {
 
     // OkHttp: streaming JPEGs to the laptop preview endpoint.
     implementation(libs.okhttp)
+
+    // ML Kit: on-device lightweight face detection for cursor gating.
+    implementation(libs.mlkit.face.detection)
 }

@@ -11,6 +11,7 @@ okhttp = "4.12.0"
 
 # kotlinx coroutines
 coroutines = "1.9.0"
+mlkitFaceDetection = "16.1.7"
 
 [libraries]
 androidx-core-ktx = { group = "androidx.core", name = "core-ktx", version.ref = "coreKtx" }
@@ -28,6 +29,7 @@ okhttp = { group = "com.squareup.okhttp3", name = "okhttp", version.ref = "okhtt
 
 # Coroutines
 kotlinx-coroutines-android = { group = "org.jetbrains.kotlinx", name = "kotlinx-coroutines-android", version.ref = "coroutines" }
+mlkit-face-detection = { group = "com.google.mlkit", name = "face-detection", version.ref = "mlkitFaceDetection" }
 
 [plugins]
 android-application = { id = "com.android.application", version.ref = "agp" }

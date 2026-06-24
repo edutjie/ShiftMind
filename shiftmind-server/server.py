@@ -24,8 +24,11 @@ async def root() -> dict:
             "/api/health",
             "/api/detect-face",
             "/api/preview",
+            "/api/preview-face",
+            "/api/preview-hud",
             "/api/preview.html",
             "/api/preview-frame",
+            "/api/hud-state",
             "/api/preview-status",
         ],
     }

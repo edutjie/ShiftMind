@@ -1,9 +1,10 @@
-"""Shared in-process state. Phase-1: latest preview frame only."""
+"""Shared in-process state for dev preview surfaces."""
 from __future__ import annotations
 
 import threading
 import time
 from dataclasses import dataclass, field
+from typing import Any
 
 
 @dataclass
@@ -31,3 +32,55 @@ class LatestFrame:
 
 
 latest_frame = LatestFrame()
+
+
+@dataclass
+class LatestFaceCrop:
+    """Single-slot face crop buffer posted by the glasses face gate."""
+
+    _lock: threading.Lock = field(default_factory=threading.Lock)
+    _jpeg: bytes | None = None
+    _box: str | None = None
+    _ts: float = 0.0
+    _seq: int = 0
+
+    def write(self, jpeg: bytes, box: str | None = None) -> None:
+        with self._lock:
+            self._jpeg = jpeg
+            self._box = box
+            self._ts = time.monotonic()
+            self._seq += 1
+
+    def read(self) -> tuple[bytes | None, str | None, float, int]:
+        with self._lock:
+            return self._jpeg, self._box, self._ts, self._seq
+
+
+latest_face_crop = LatestFaceCrop()
+
+
+@dataclass
+class LatestHudState:
+    """Single-slot HUD state buffer posted by the glasses.
+
+    Keep this separate from latest_frame so model inputs can stay raw while
+    browser preview gets a late human-only HUD overlay.
+    """
+
+    _lock: threading.Lock = field(default_factory=threading.Lock)
+    _state: dict[str, Any] | None = None
+    _ts: float = 0.0
+    _seq: int = 0
+
+    def write(self, state: dict[str, Any]) -> None:
+        with self._lock:
+            self._state = state
+            self._ts = time.monotonic()
+            self._seq += 1
+
+    def read(self) -> tuple[dict[str, Any] | None, float, int]:
+        with self._lock:
+            return self._state, self._ts, self._seq
+
+
+latest_hud_state = LatestHudState()

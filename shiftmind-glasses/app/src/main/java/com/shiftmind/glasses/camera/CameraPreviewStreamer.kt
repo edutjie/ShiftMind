@@ -18,6 +18,8 @@ import android.view.Surface
 import androidx.lifecycle.DefaultLifecycleObserver
 import androidx.lifecycle.LifecycleOwner
 import com.shiftmind.glasses.BuildConfig
+import com.shiftmind.glasses.hud.CustomerCard
+import com.shiftmind.glasses.hud.HudStateHolder
 import com.shiftmind.glasses.net.PreviewClient
 import java.io.ByteArrayOutputStream
 import java.util.concurrent.atomic.AtomicLong
@@ -78,6 +80,10 @@ class CameraPreviewStreamer(
     private var captureSession: CameraCaptureSession? = null
     private var lifecycleObserver: DefaultLifecycleObserver? = null
     private var ownerRef: LifecycleOwner? = null
+    private var faceGateDetector: FaceGateDetector? = null
+    @Volatile private var latestPreviewJpeg: ByteArray? = null
+    @Volatile private var latestFaceCropJpeg: ByteArray? = null
+    @Volatile private var latestFaceBoxJson: String? = null
 
     private var retryAttempt = 0
     private var pendingRetry: Runnable? = null
@@ -120,6 +126,7 @@ class CameraPreviewStreamer(
         val reader = ImageReader.newInstance(width, height, ImageFormat.YUV_420_888, 2)
         reader.setOnImageAvailableListener({ r -> onImageAvailable(r) }, handler)
         imageReader = reader
+        faceGateDetector = FaceGateDetector(width, height, onResult = ::onFaceGateResult)
 
         try {
             manager.openCamera(cameraId, cameraStateCallback, handler)
@@ -274,8 +281,15 @@ class CameraPreviewStreamer(
             val prev = lastSentNs.get()
             if (now - prev < frameIntervalNs) return
             if (!lastSentNs.compareAndSet(prev, now)) return
-            val jpeg = image.toJpeg(jpegQuality) ?: return
-            previewClient.postFrame(jpeg)
+            val nv21 = image.toNv21() ?: return
+            val jpeg = nv21.toJpeg(Rect(0, 0, width, height), jpegQuality) ?: return
+            latestPreviewJpeg = jpeg
+            previewClient.postFrame(
+                jpeg = jpeg,
+                faceCropJpeg = latestFaceCropJpeg,
+                faceBox = latestFaceBoxJson,
+            )
+            faceGateDetector?.process(nv21)
         } catch (t: Throwable) {
             Log.w(TAG, "frame handler error", t)
         } finally {
@@ -303,16 +317,21 @@ class CameraPreviewStreamer(
         cameraDevice = null
         try { imageReader?.close() } catch (_: Throwable) {}
         imageReader = null
+        try { faceGateDetector?.close() } catch (_: Throwable) {}
+        faceGateDetector = null
+        latestPreviewJpeg = null
+        latestFaceCropJpeg = null
+        latestFaceBoxJson = null
         cameraThread?.quitSafely()
         cameraThread = null
         cameraHandler = null
     }
 
     /**
-     * YUV_420_888 → JPEG via NV21. Good enough for preview-quality JPEGs
-     * even when row/pixel strides aren't ideal.
+     * YUV_420_888 → NV21. Good enough for preview-quality frames even when
+     * row/pixel strides aren't ideal on this HAL.
      */
-    private fun Image.toJpeg(quality: Int): ByteArray? {
+    private fun Image.toNv21(): ByteArray? {
         if (format != ImageFormat.YUV_420_888) {
             Log.w(TAG, "unexpected image format $format")
             return null
@@ -333,17 +352,53 @@ class CameraPreviewStreamer(
         vBuf.get(nv21, ySize, vSize)
         uBuf.get(nv21, ySize + vSize, uSize)
 
-        val yuv = YuvImage(nv21, ImageFormat.NV21, width, height, null)
+        return nv21
+    }
+
+    private fun ByteArray.toJpeg(rect: Rect, quality: Int): ByteArray? {
+        val yuv = YuvImage(this, ImageFormat.NV21, width, height, null)
         val out = ByteArrayOutputStream(64 * 1024)
-        return if (yuv.compressToJpeg(Rect(0, 0, width, height), quality, out)) {
+        return if (yuv.compressToJpeg(rect, quality, out)) {
             out.toByteArray()
         } else {
             null
         }
     }
 
+    private fun onFaceGateResult(result: FaceGateResult) {
+        val faceBox = result.faceBox
+        if (result.faceInCursor && faceBox != null) {
+            latestFaceCropJpeg = result.faceCropJpeg
+            latestFaceBoxJson = faceBox.toJson()
+            HudStateHolder.mutate {
+                it.copy(
+                    statusLine = "face aligned",
+                    customerCard = DUMMY_CUSTOMER,
+                )
+            }
+        } else {
+            latestFaceCropJpeg = null
+            latestFaceBoxJson = null
+            HudStateHolder.mutate {
+                it.copy(
+                    statusLine = if (result.faceDetected) "align face in box" else "awaiting customer",
+                    customerCard = null,
+                )
+            }
+        }
+    }
+
+    private fun Rect.toJson(): String =
+        """{"left":$left,"top":$top,"right":$right,"bottom":$bottom}"""
+
     companion object {
         private const val TAG = "ShiftMind.Camera"
+        private val DUMMY_CUSTOMER = CustomerCard(
+            name = "MeiXi",
+            lastVisit = "2026-06-18",
+            memoryLine = "Dummy profile: prefers lightweight jackets",
+            preferences = listOf("neutral colors", "size M"),
+        )
         // Retry plan: 500ms, 1s, 2s, 3s, 5s — covers short camera-service
         // handoff windows after another client releases the sensor.
         private val RETRY_DELAYS_MS = longArrayOf(500, 1000, 2000, 3000, 5000)

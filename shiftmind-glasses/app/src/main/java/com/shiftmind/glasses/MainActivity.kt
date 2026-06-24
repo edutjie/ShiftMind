@@ -14,14 +14,20 @@ import android.widget.Toast
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.setContent
 import androidx.activity.result.contract.ActivityResultContracts
+import androidx.lifecycle.lifecycleScope
 import androidx.core.content.ContextCompat
 import com.shiftmind.glasses.camera.CameraPreviewStreamer
 import com.shiftmind.glasses.hud.HudScreen
+import com.shiftmind.glasses.hud.HudStateHolder
+import com.shiftmind.glasses.net.HudStateClient
 import com.shiftmind.glasses.recording.ArRecorder
 import com.shiftmind.glasses.recording.RecordingStateReceiver
 import com.shiftmind.glasses.recording.RokidHudRecorder
 import com.shiftmind.glasses.service.GlassesService
 import com.shiftmind.glasses.ui.theme.GlassHudTheme
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.launch
+import kotlinx.coroutines.withContext
 import java.text.SimpleDateFormat
 import java.util.Date
 import java.util.Locale
@@ -31,6 +37,7 @@ class MainActivity : ComponentActivity() {
     private val streamer by lazy { CameraPreviewStreamer(applicationContext) }
     private val recorder by lazy { ArRecorder(applicationContext, streamer, extraRotationDeg = BuildConfig.RECORDING_ROTATION_DEG) }
     private val hudRecorder by lazy { RokidHudRecorder(applicationContext) }
+    private val hudStateClient by lazy { HudStateClient() }
 
     // External AR recorder (Rokid mix_record from OverlayRec etc.) is no longer
     // expected to be used now that ShiftMind has its own recorder — but if
@@ -94,6 +101,7 @@ class MainActivity : ComponentActivity() {
 
         recordingReceiver.register(this)
         hudRecorder.observeStateBroadcasts()
+        startHudStateMirror()
         ensureCameraPermission()
         ensureAudioPermission()
 
@@ -204,6 +212,17 @@ class MainActivity : ComponentActivity() {
         if (!hasCameraPerm()) return
         // streamer.start() is idempotent + self-retries on CAMERA_IN_USE.
         streamer.start(this)
+    }
+
+    private fun startHudStateMirror() {
+        lifecycleScope.launch {
+            HudStateHolder.stateFlow
+                .collect { state ->
+                    withContext(Dispatchers.IO) {
+                        hudStateClient.postState(state)
+                    }
+                }
+        }
     }
 
     @Suppress("DEPRECATION")

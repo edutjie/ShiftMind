@@ -1,7 +1,9 @@
 """Dev-only live preview pipeline.
 
   POST /api/preview-frame   producer  (multipart JPEG → in-memory slot)
+  POST /api/hud-state       producer  (glasses HUD state JSON)
   GET  /api/preview         consumer  (MJPEG stream: multipart/x-mixed-replace)
+  GET  /api/preview-hud     consumer  (MJPEG stream with HUD overlay)
   GET  /api/preview-status  metadata  (latest seq + age in seconds)
 
 Open `http://<host>:8000/api/preview` in a browser to watch the live feed.
@@ -21,10 +23,11 @@ import time
 
 import cv2
 import numpy as np
-from fastapi import APIRouter, File, UploadFile
+from fastapi import APIRouter, File, Form, UploadFile
 from fastapi.responses import HTMLResponse, StreamingResponse
+from pydantic import BaseModel, Field
 
-from state import latest_frame
+from state import latest_face_crop, latest_frame, latest_hud_state
 
 router = APIRouter()
 
@@ -39,6 +42,21 @@ BOUNDARY = b"frame"
 # If a different Rokid model with different mounting ships later, expose this
 # via env / per-frame metadata.
 PREVIEW_ROTATE_CV2 = cv2.ROTATE_90_COUNTERCLOCKWISE
+_recording_started_at: float | None = None
+
+
+class CustomerCardPayload(BaseModel):
+    name: str = ""
+    lastVisit: str | None = None
+    memoryLine: str | None = None
+    preferences: list[str] = Field(default_factory=list)
+
+
+class HudStatePayload(BaseModel):
+    title: str = "ShiftMind"
+    statusLine: str | None = None
+    customerCard: CustomerCardPayload | None = None
+    recordingActive: bool = False
 
 
 def _make_placeholder_jpeg() -> bytes:
@@ -56,39 +74,183 @@ def _make_placeholder_jpeg() -> bytes:
 _PLACEHOLDER_JPEG = _make_placeholder_jpeg()
 
 
-def _rotate_jpeg(jpeg: bytes) -> bytes:
-    """Decode → rotate → re-encode. cv2 handles JPEG in/out natively.
+def _decode_and_rotate(jpeg: bytes) -> np.ndarray | None:
+    arr = np.frombuffer(jpeg, dtype=np.uint8)
+    img = cv2.imdecode(arr, cv2.IMREAD_COLOR)
+    if img is None:
+        return None
+    return cv2.rotate(img, PREVIEW_ROTATE_CV2)
+
+
+def _encode_jpeg(img: np.ndarray) -> bytes | None:
+    ok, buf = cv2.imencode(".jpg", img, [int(cv2.IMWRITE_JPEG_QUALITY), 80])
+    return buf.tobytes() if ok else None
+
+
+def _preview_jpeg(jpeg: bytes, *, with_hud: bool) -> bytes:
+    """Decode → rotate → optional HUD overlay → re-encode.
 
     Cost on a 640x480 frame is ~3 ms each on a 2024 laptop CPU; trivial next
     to the 100 ms frame interval. If we ever care, swap to lossless transpose
     on the JPEG bitstream directly (`jpegtran` or `pyturbojpeg`).
     """
-    arr = np.frombuffer(jpeg, dtype=np.uint8)
-    img = cv2.imdecode(arr, cv2.IMREAD_COLOR)
+    img = _decode_and_rotate(jpeg)
     if img is None:
         return jpeg  # decode failed; fall back to raw bytes
-    rotated = cv2.rotate(img, PREVIEW_ROTATE_CV2)
-    ok, buf = cv2.imencode(".jpg", rotated, [int(cv2.IMWRITE_JPEG_QUALITY), 80])
-    return buf.tobytes() if ok else jpeg
+    if with_hud:
+        _draw_hud_overlay(img)
+    return _encode_jpeg(img) or jpeg
+
+
+def _draw_hud_overlay(img: np.ndarray) -> None:
+    """Approximate the Compose prism HUD on top of the web preview frame."""
+    global _recording_started_at
+
+    state, _, _ = latest_hud_state.read()
+    if not state:
+        state = {"title": "ShiftMind", "statusLine": "awaiting customer", "recordingActive": False}
+
+    h, w = img.shape[:2]
+    green = (0, 255, 0)
+    white = (238, 238, 238)
+    muted = (190, 190, 190)
+    red = (58, 58, 255)
+
+    title = str(state.get("title") or "ShiftMind")
+    _center_text(img, title, y=int(h * 0.155), scale=_scale_for_width(w, 1.25), color=green, thickness=2)
+
+    status = state.get("statusLine")
+    if status:
+        _center_text(img, str(status), y=int(h * 0.205), scale=_scale_for_width(w, 0.46), color=muted, thickness=1)
+
+    recording_active = bool(state.get("recordingActive"))
+    if recording_active and _recording_started_at is None:
+        _recording_started_at = time.monotonic()
+    elif not recording_active:
+        _recording_started_at = None
+
+    if recording_active:
+        elapsed = int(time.monotonic() - (_recording_started_at or time.monotonic()))
+        rec = f"REC {elapsed // 60:02d}:{elapsed % 60:02d}"
+        rec_scale = _scale_for_width(w, 0.46)
+        rec_size, _ = cv2.getTextSize(rec, cv2.FONT_HERSHEY_SIMPLEX, rec_scale, 1)
+        rec_x = max(8, w - rec_size[0] - 18)
+        rec_y = int(h * 0.095)
+        cv2.circle(img, (rec_x - 12, rec_y - 5), 5, red, -1, cv2.LINE_AA)
+        cv2.putText(img, rec, (rec_x, rec_y), cv2.FONT_HERSHEY_SIMPLEX, rec_scale, red, 1, cv2.LINE_AA)
+
+    card = state.get("customerCard")
+    if isinstance(card, dict):
+        name = str(card.get("name") or "").strip()
+        memory = str(card.get("memoryLine") or "").strip()
+        if name:
+            card_w = min(w - 48, int(w * 0.74))
+            x0 = max(24, (w - card_w) // 2)
+            y0 = int(h * 0.235)
+            y1 = y0 + (int(h * 0.11) if memory else int(h * 0.07))
+            overlay = img.copy()
+            cv2.rectangle(overlay, (x0, y0), (x0 + card_w, y1), (0, 0, 0), -1)
+            cv2.addWeighted(overlay, 0.42, img, 0.58, 0, img)
+            cv2.rectangle(img, (x0, y0), (x0 + card_w, y1), green, 1)
+            cv2.putText(
+                img,
+                name,
+                (x0 + 14, y0 + int(h * 0.04)),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                _scale_for_width(w, 0.55),
+                green,
+                1,
+                cv2.LINE_AA,
+            )
+            if memory:
+                _fit_text(
+                    img,
+                    memory,
+                    (x0 + 14, y0 + int(h * 0.078)),
+                    max_width=card_w - 28,
+                    color=white,
+                )
+
+    # Compose BoxCursor is 240dp on a 480px-wide glasses surface: about half
+    # viewport width. Web overlay uses the same proportion after rotation.
+    box_w = int(w * 0.50)
+    box_h = box_w
+    cx, cy = w // 2, int(h * 0.58)
+    x0, y0 = cx - box_w // 2, cy - box_h // 2
+    x1, y1 = cx + box_w // 2, cy + box_h // 2
+    corner = int(box_w * 0.18)
+    stroke = max(2, int(round(w / 180)))
+    for sx, sy in [(x0, y0), (x1, y0), (x0, y1), (x1, y1)]:
+        dx = corner if sx == x0 else -corner
+        dy = corner if sy == y0 else -corner
+        cv2.line(img, (sx, sy), (sx + dx, sy), green, stroke, cv2.LINE_AA)
+        cv2.line(img, (sx, sy), (sx, sy + dy), green, stroke, cv2.LINE_AA)
+
+    tick = max(12, int(w * 0.025))
+    cv2.line(img, (cx - tick, cy), (cx + tick, cy), green, stroke, cv2.LINE_AA)
+    cv2.line(img, (cx, cy - tick), (cx, cy + tick), green, stroke, cv2.LINE_AA)
+
+
+def _scale_for_width(width: int, base_at_480: float) -> float:
+    return max(0.25, base_at_480 * (width / 480.0))
+
+
+def _center_text(img: np.ndarray, text: str, *, y: int, scale: float, color: tuple[int, int, int], thickness: int) -> None:
+    size, _ = cv2.getTextSize(text, cv2.FONT_HERSHEY_SIMPLEX, scale, thickness)
+    x = max(0, (img.shape[1] - size[0]) // 2)
+    cv2.putText(img, text, (x, y), cv2.FONT_HERSHEY_SIMPLEX, scale, color, thickness, cv2.LINE_AA)
+
+
+def _fit_text(img: np.ndarray, text: str, origin: tuple[int, int], *, max_width: int, color: tuple[int, int, int]) -> None:
+    scale = 0.38
+    while scale > 0.24:
+        size, _ = cv2.getTextSize(text, cv2.FONT_HERSHEY_SIMPLEX, scale, 1)
+        if size[0] <= max_width:
+            break
+        scale -= 0.03
+    cv2.putText(img, text, origin, cv2.FONT_HERSHEY_SIMPLEX, scale, color, 1, cv2.LINE_AA)
 
 
 @router.post("/api/preview-frame")
-async def preview_frame(image: UploadFile = File(...)) -> dict:
+async def preview_frame(
+    image: UploadFile = File(...),
+    face_crop: UploadFile | None = File(default=None),
+    face_box: str | None = Form(default=None),
+) -> dict:
     """Producer endpoint. Glasses (or feed_webcam.py) POST JPEG frames here."""
     jpeg = await image.read()
     if not jpeg:
         return {"received": False, "reason": "empty"}
     latest_frame.write(jpeg)
-    return {"received": True, "bytes": len(jpeg)}
+    face_bytes = await face_crop.read() if face_crop is not None else b""
+    if face_bytes:
+        latest_face_crop.write(face_bytes, face_box)
+    return {"received": True, "bytes": len(jpeg), "face_crop": bool(face_bytes)}
+
+
+@router.post("/api/hud-state")
+async def hud_state(payload: HudStatePayload) -> dict:
+    """Producer endpoint. Glasses POST current HUD state for web overlay."""
+    latest_hud_state.write(payload.dict())
+    return {"received": True}
 
 
 @router.get("/api/preview-status")
 async def preview_status() -> dict:
     jpeg, ts, seq = latest_frame.read()
+    hud, hud_ts, hud_seq = latest_hud_state.read()
+    face, face_box, face_ts, face_seq = latest_face_crop.read()
     return {
         "have_frame": jpeg is not None,
         "seq": seq,
         "age_seconds": (time.monotonic() - ts) if jpeg is not None else None,
+        "have_hud_state": hud is not None,
+        "hud_seq": hud_seq,
+        "hud_age_seconds": (time.monotonic() - hud_ts) if hud is not None else None,
+        "have_face_crop": face is not None,
+        "face_seq": face_seq,
+        "face_box": face_box,
+        "face_age_seconds": (time.monotonic() - face_ts) if face is not None else None,
     }
 
 
@@ -101,25 +263,65 @@ def _mjpeg_chunk(jpeg: bytes) -> bytes:
     )
 
 
-async def _mjpeg_generator():
+async def _mjpeg_generator(*, with_hud: bool):
     last_seq = -1
+    last_hud_seq = -1
     cached_rotated: bytes | None = None  # rotate once per fresh frame, reuse if no new seq
     while True:
         jpeg, _, seq = latest_frame.read()
+        _, _, hud_seq = latest_hud_state.read()
+        if jpeg is None:
+            yield _mjpeg_chunk(_PLACEHOLDER_JPEG)
+        elif seq != last_seq or (with_hud and hud_seq != last_hud_seq):
+            cached_rotated = _preview_jpeg(jpeg, with_hud=with_hud)
+            yield _mjpeg_chunk(cached_rotated)
+            last_seq = seq
+            last_hud_seq = hud_seq
+        # else: same frame as last tick, skip the write to avoid wasted bandwidth
+        await asyncio.sleep(FRAME_INTERVAL)
+
+
+async def _face_crop_generator():
+    last_seq = -1
+    while True:
+        jpeg, _, _, seq = latest_face_crop.read()
         if jpeg is None:
             yield _mjpeg_chunk(_PLACEHOLDER_JPEG)
         elif seq != last_seq:
-            cached_rotated = _rotate_jpeg(jpeg)
-            yield _mjpeg_chunk(cached_rotated)
+            yield _mjpeg_chunk(_rotate_face_crop_jpeg(jpeg))
             last_seq = seq
-        # else: same frame as last tick, skip the write to avoid wasted bandwidth
         await asyncio.sleep(FRAME_INTERVAL)
+
+
+def _rotate_face_crop_jpeg(jpeg: bytes) -> bytes:
+    arr = np.frombuffer(jpeg, dtype=np.uint8)
+    img = cv2.imdecode(arr, cv2.IMREAD_COLOR)
+    if img is None:
+        return jpeg
+    rotated = cv2.rotate(img, cv2.ROTATE_90_COUNTERCLOCKWISE)
+    return _encode_jpeg(rotated) or jpeg
 
 
 @router.get("/api/preview")
 async def preview():
     return StreamingResponse(
-        _mjpeg_generator(),
+        _mjpeg_generator(with_hud=False),
+        media_type=f"multipart/x-mixed-replace; boundary={BOUNDARY.decode()}",
+    )
+
+
+@router.get("/api/preview-hud")
+async def preview_hud():
+    return StreamingResponse(
+        _mjpeg_generator(with_hud=True),
+        media_type=f"multipart/x-mixed-replace; boundary={BOUNDARY.decode()}",
+    )
+
+
+@router.get("/api/preview-face")
+async def preview_face():
+    return StreamingResponse(
+        _face_crop_generator(),
         media_type=f"multipart/x-mixed-replace; boundary={BOUNDARY.decode()}",
     )
 
@@ -130,9 +332,15 @@ async def preview_html() -> HTMLResponse:
     html = """<!doctype html><html><head><title>ShiftMind preview</title>
 <style>body{margin:0;background:#000;color:#0f0;font:14px monospace;display:flex;
 flex-direction:column;align-items:center;padding:12px}
-img{max-width:100%;height:auto;border:1px solid #0f0}</style></head>
-<body><h3>shiftmind live preview</h3>
-<img src="/api/preview" alt="live MJPEG stream" />
-<p>POST JPEGs to <code>/api/preview-frame</code> to feed this.</p>
+main{display:flex;gap:16px;align-items:flex-start;justify-content:center;flex-wrap:wrap}
+section{display:flex;flex-direction:column;align-items:center;gap:8px}
+img{max-width:100%;height:auto;border:1px solid #0f0}
+.face{width:220px;min-height:160px;object-fit:contain}</style></head>
+<body><h3>shiftmind live preview + HUD</h3>
+<main>
+  <section><strong>HUD preview</strong><img src="/api/preview-hud" alt="live MJPEG stream with HUD" /></section>
+  <section><strong>face crop</strong><img class="face" src="/api/preview-face" alt="latest detected face crop" /></section>
+</main>
+<p><a href="/api/preview">raw preview</a> · POST JPEGs to <code>/api/preview-frame</code> and HUD JSON to <code>/api/hud-state</code>.</p>
 </body></html>"""
     return HTMLResponse(html)

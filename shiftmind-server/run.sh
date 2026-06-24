@@ -1,20 +1,33 @@
 #!/usr/bin/env bash
-# Dev runner: starts the FastAPI server and, if a glass is plugged in via USB,
-# sets up `adb reverse tcp:8000 tcp:8000` so the device can hit the laptop at
-# 127.0.0.1:8000. Idempotent — safe to run repeatedly. Tunnel is torn down on
-# Ctrl+C.
+# Dev runner: starts all server-side dev pieces and, if glasses are plugged in
+# via USB, sets up `adb reverse tcp:8000 tcp:8000` so the device can hit the
+# laptop at 127.0.0.1:8000. Idempotent — safe to run repeatedly. Child
+# processes and tunnel are torn down on Ctrl+C.
 #
 # Usage:
-#   ./run.sh                  # 0.0.0.0:8000 with --reload
+#   ./run.sh                  # all: adb reverse + uvicorn
+#   ./run.sh all              # same as above
+#   ./run.sh server           # uvicorn only (still honors adb unless NO_ADB=1)
 #   PORT=9000 ./run.sh        # override port (both tunnel + uvicorn)
 #   NO_RELOAD=1 ./run.sh      # disable autoreload
 #   NO_ADB=1 ./run.sh         # skip adb reverse (e.g. running over WiFi)
+#   OPEN_PREVIEW=1 ./run.sh   # open /api/preview.html after server starts
+#   WEBCAM=1 ./run.sh         # also feed laptop webcam into /api/preview-frame
 set -euo pipefail
 
 cd "$(dirname "$0")"
 
+MODE="${1:-all}"
 PORT="${PORT:-8000}"
 HOST="${HOST:-0.0.0.0}"
+LOCAL_URL="http://127.0.0.1:${PORT}"
+PIDS=()
+
+if [[ "$MODE" != "all" && "$MODE" != "server" ]]; then
+  echo "[run.sh] unknown mode: $MODE"
+  echo "[run.sh] usage: ./run.sh [all|server]"
+  exit 2
+fi
 
 # ── adb reverse tunnel ────────────────────────────────────────────────────
 # Find adb. Prefer $PATH, else fall back to common Android SDK locations.
@@ -57,6 +70,14 @@ fi
 # Tear down the tunnel on exit so a later WiFi-only session doesn't see a
 # stale entry blocking the port forward.
 cleanup() {
+  if ((${#PIDS[@]})); then
+    echo
+    echo "[run.sh] stopping child processes"
+    for pid in "${PIDS[@]}"; do
+      kill "$pid" 2>/dev/null || true
+    done
+    wait "${PIDS[@]}" 2>/dev/null || true
+  fi
   if [[ "$adb_reverse_set" == true ]]; then
     echo
     echo "[run.sh] removing adb reverse tcp:${PORT}"
@@ -65,9 +86,35 @@ cleanup() {
 }
 trap cleanup EXIT INT TERM
 
-# ── uvicorn ───────────────────────────────────────────────────────────────
+# ── processes ─────────────────────────────────────────────────────────────
 reload_flag="--reload"
 [[ -n "${NO_RELOAD:-}" ]] && reload_flag=""
 
 echo "[run.sh] starting uvicorn on ${HOST}:${PORT}${reload_flag:+ (reload)}"
-exec uv run uvicorn server:app --host "$HOST" --port "$PORT" $reload_flag
+uv run uvicorn server:app --host "$HOST" --port "$PORT" $reload_flag &
+PIDS+=("$!")
+
+echo "[run.sh] preview:     ${LOCAL_URL}/api/preview.html"
+echo "[run.sh] raw MJPEG:   ${LOCAL_URL}/api/preview"
+echo "[run.sh] HUD MJPEG:   ${LOCAL_URL}/api/preview-hud"
+echo "[run.sh] status:      ${LOCAL_URL}/api/preview-status"
+
+if [[ -n "${OPEN_PREVIEW:-}" ]]; then
+  if command -v open >/dev/null 2>&1; then
+    (sleep 1; open "${LOCAL_URL}/api/preview.html") &
+  elif command -v xdg-open >/dev/null 2>&1; then
+    (sleep 1; xdg-open "${LOCAL_URL}/api/preview.html") &
+  else
+    echo "[run.sh] OPEN_PREVIEW set but no open/xdg-open found"
+  fi
+fi
+
+if [[ -n "${WEBCAM:-}" ]]; then
+  fps="${WEBCAM_FPS:-5}"
+  device="${WEBCAM_DEVICE:-0}"
+  echo "[run.sh] starting webcam feeder (device=${device}, fps=${fps})"
+  uv run python tools/feed_webcam.py --url "${LOCAL_URL}" --fps "$fps" --device "$device" &
+  PIDS+=("$!")
+fi
+
+wait "${PIDS[@]}"

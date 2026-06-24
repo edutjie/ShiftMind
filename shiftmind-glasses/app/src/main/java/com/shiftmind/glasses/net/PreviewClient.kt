@@ -35,15 +35,29 @@ class PreviewClient(private val baseUrl: String = BuildConfig.SERVER_URL) {
     private var consecutiveErrors = 0
 
     /** Returns true on 2xx, false otherwise. Never throws. */
-    fun postFrame(jpeg: ByteArray): Boolean {
-        val body = MultipartBody.Builder()
+    fun postFrame(
+        jpeg: ByteArray,
+        faceCropJpeg: ByteArray? = null,
+        faceBox: String? = null,
+    ): Boolean {
+        val bodyBuilder = MultipartBody.Builder()
             .setType(MultipartBody.FORM)
             .addFormDataPart(
                 "image",
                 "frame.jpg",
                 jpeg.toRequestBody("image/jpeg".toMediaType()),
             )
-            .build()
+        if (faceCropJpeg != null) {
+            bodyBuilder.addFormDataPart(
+                "face_crop",
+                "face.jpg",
+                faceCropJpeg.toRequestBody("image/jpeg".toMediaType()),
+            )
+        }
+        if (faceBox != null) {
+            bodyBuilder.addFormDataPart("face_box", faceBox)
+        }
+        val body = bodyBuilder.build()
         val req = Request.Builder().url(endpoint).post(body).build()
         return try {
             client.newCall(req).execute().use { resp ->
