@@ -1,6 +1,7 @@
 package com.shiftmind.glasses.hud
 
 import androidx.compose.foundation.background
+import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.Spacer
@@ -120,26 +121,88 @@ fun HudScreen() {
         }
 
         // Customer card — appears just under title when a known face is recognised.
+        // Name + stored memory sit near the top; the live transcript is pinned to
+        // the bottom of the viewport so it never overlaps the memory card.
         state.customerCard?.let { card ->
             Column(
                 modifier = Modifier
                     .fillMaxSize()
-                    .padding(top = 140.dp, start = 24.dp, end = 24.dp),
+                    .padding(top = 150.dp, start = 24.dp, end = 24.dp),
                 horizontalAlignment = Alignment.CenterHorizontally,
             ) {
+                // Customer name
                 Text(
                     text = card.name,
                     color = Color(0xFF00FF00),
                     fontSize = 16.sp,
                     fontWeight = FontWeight.Bold,
                 )
-                card.memoryLine?.let { mem ->
+
+                // Last visit info (if available)
+                card.lastVisit?.let { visit ->
                     Spacer(Modifier.height(2.dp))
                     Text(
-                        text = mem,
-                        color = Color.White,
-                        fontSize = 10.sp,
+                        text = visit,
+                        color = Color.White.copy(alpha = 0.6f),
+                        fontSize = 9.sp,
                     )
+                }
+
+                Spacer(Modifier.height(6.dp))
+
+                // Stored memory section - fixed height so live-transcript updates
+                // below never reflow this block (the cause of flicker).
+                Column(
+                    modifier = Modifier.height(72.dp),
+                    horizontalAlignment = Alignment.CenterHorizontally,
+                ) {
+                    if (card.memoryLine != null) {
+                        Text(
+                            text = "💭 Memory",
+                            color = Color(0xFF00FF00).copy(alpha = 0.7f),
+                            fontSize = 8.sp,
+                        )
+                        Spacer(Modifier.height(2.dp))
+                        Text(
+                            text = card.memoryLine,
+                            color = Color(0xFF00FF00).copy(alpha = 0.85f),
+                            fontSize = 11.sp,
+                            lineHeight = 14.sp,
+                            maxLines = 5,
+                        )
+                    }
+                }
+            }
+
+            // Live transcript — pinned to a fixed-height box at the bottom of the
+            // viewport. Fixed height keeps the text bottom-anchored without
+            // reflowing as the line count changes, eliminating flicker.
+            if (card.liveTranscript != null) {
+                Box(
+                    modifier = Modifier
+                        .fillMaxSize()
+                        .padding(start = 24.dp, end = 24.dp, bottom = 20.dp),
+                    contentAlignment = Alignment.BottomCenter,
+                ) {
+                    Column(
+                        modifier = Modifier.height(64.dp),
+                        verticalArrangement = Arrangement.Bottom,
+                        horizontalAlignment = Alignment.CenterHorizontally,
+                    ) {
+                        Text(
+                            text = "📝 Live",
+                            color = Color.White.copy(alpha = 0.7f),
+                            fontSize = 8.sp,
+                        )
+                        Spacer(Modifier.height(2.dp))
+                        Text(
+                            text = card.liveTranscript,
+                            color = Color.White,
+                            fontSize = 10.sp,
+                            lineHeight = 13.sp,
+                            maxLines = 3,
+                        )
+                    }
                 }
             }
         }

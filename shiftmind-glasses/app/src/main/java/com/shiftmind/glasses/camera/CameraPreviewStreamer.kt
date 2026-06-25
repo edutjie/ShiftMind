@@ -19,6 +19,7 @@ import androidx.lifecycle.DefaultLifecycleObserver
 import androidx.lifecycle.LifecycleOwner
 import com.shiftmind.glasses.BuildConfig
 import com.shiftmind.glasses.hud.HudStateHolder
+import com.shiftmind.glasses.session.CustomerSessionHolder
 import com.shiftmind.glasses.net.PreviewClient
 import java.io.ByteArrayOutputStream
 import java.util.concurrent.atomic.AtomicLong
@@ -365,6 +366,7 @@ class CameraPreviewStreamer(
     }
 
     private fun onFaceGateResult(result: FaceGateResult) {
+        if (CustomerSessionHolder.current != null) return
         val faceBox = result.faceBox
         if (result.faceInCursor && faceBox != null) {
             latestFaceCropJpeg = result.faceCropJpeg

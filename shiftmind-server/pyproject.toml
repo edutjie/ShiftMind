@@ -13,10 +13,24 @@ dependencies = [
     "insightface>=0.7.3",
     "onnxruntime>=1.18",
     "pymilvus[milvus_lite]>=2.5",
+    "openai>=1.90",
+    "python-dotenv>=1.0",
+    "websockets>=15",
+    "python-socks>=2.8.2",
+    "aiohttp>=3.14.1",
 ]
 
 [tool.uv]
 package = false
+
+[dependency-groups]
+dev = [
+    "pytest>=9.1.1",
+    "pytest-asyncio>=1.4.0",
+]
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
 
 # Heavy ML deps deferred to phase 3+:
 #   uv add openai-whisper ultralytics

@@ -6,6 +6,7 @@ import asyncio
 from fastapi import APIRouter, File, UploadFile
 
 from face_recognition_service import get_face_service
+from session_service import session_service
 from state import latest_recognition_state
 
 router = APIRouter()
@@ -16,5 +17,8 @@ async def detect_face(image: UploadFile = File(...)) -> dict:
     payload = await image.read()
     result = await asyncio.to_thread(get_face_service().recognize, payload)
     data = result.to_dict()
+    active_session = await asyncio.to_thread(session_service.ensure_from_recognition, result, payload)
+    if active_session:
+        data["active_session"] = active_session.to_dict()
     latest_recognition_state.write(data)
     return data

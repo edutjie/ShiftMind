@@ -26,6 +26,12 @@ htmlcov/
 coverage.xml
 *.cover
 
+# ───── Runtime state ─────
+*.log
+*.db
+*.db-shm
+*.db-wal
+
 # ───── Build artifacts ─────
 dist/
 build/

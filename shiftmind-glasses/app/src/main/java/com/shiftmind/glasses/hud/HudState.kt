@@ -37,6 +37,7 @@ data class HudState(
 data class CustomerCard(
     val name: String,
     val lastVisit: String?,            // "2026-06-01"
-    val memoryLine: String?,           // free-text note ("Last visit: bought running shoes")
+    val memoryLine: String?,           // Stored memory from previous sessions
+    val liveTranscript: String? = null, // Live transcript during active session
     val preferences: List<String> = emptyList(),
 )

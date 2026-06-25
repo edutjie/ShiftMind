@@ -43,6 +43,10 @@ android {
         // Override with shiftmind.recordingKey=NNN in local.properties; every
         // keycode received is logged at INFO under `ShiftMind.Main`.
         val recordingKey = localProp("shiftmind.recordingKey", "66")
+        // Separate key to stop the active customer voice/session flow. Keep
+        // this different from shiftmind.recordingKey so AR recording can cover
+        // the whole experiment while sessions start/stop inside it.
+        val sessionKey = localProp("shiftmind.sessionKey", "23")
         // Extra rotation (degrees, multiple of 90) applied to camera texture.
         // Default -90 matches server preview: raw 640x480 sensor -> upright
         // 480x640 recording. If future hardware differs, try 0 / 90 / 180.
@@ -50,6 +54,7 @@ android {
         buildConfigField("String", "SERVER_URL", "\"$serverUrl\"")
         buildConfigField("int", "PREVIEW_FPS", previewFps)
         buildConfigField("int", "RECORDING_KEY", recordingKey)
+        buildConfigField("int", "SESSION_KEY", sessionKey)
         buildConfigField("int", "RECORDING_ROTATION_DEG", recordingRotation)
     }
 

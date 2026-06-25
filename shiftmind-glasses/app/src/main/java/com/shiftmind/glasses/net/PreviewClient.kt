@@ -4,6 +4,8 @@ import android.util.Log
 import com.shiftmind.glasses.BuildConfig
 import com.shiftmind.glasses.hud.CustomerCard
 import com.shiftmind.glasses.hud.HudStateHolder
+import com.shiftmind.glasses.session.CustomerSessionHolder
+import com.shiftmind.glasses.session.CustomerSessionState
 import okhttp3.MediaType.Companion.toMediaType
 import okhttp3.MultipartBody
 import okhttp3.OkHttpClient
@@ -83,9 +85,23 @@ class PreviewClient(private val baseUrl: String = BuildConfig.SERVER_URL) {
     }
 
     private fun applyRecognitionResponse(body: String) {
+        val root = runCatching { JSONObject(body) }.getOrNull() ?: return
+        val activeSession = root.optJSONObject("active_session")
+        activeSession?.let { applyActiveSession(it) }
         val recognition = runCatching {
-            JSONObject(body).optJSONObject("recognition")
+            root.optJSONObject("recognition")
         }.getOrNull() ?: return
+        val recognitionSession = recognition.optJSONObject("active_session")
+        recognitionSession?.let { applyActiveSession(it) }
+
+        // While a customer session is active, MainActivity owns the customerCard
+        // (it drives the live transcript). Rebuilding the card from per-frame
+        // recognition_status here would wipe liveTranscript every frame and make
+        // the HUD flicker. Skip recognition-driven card mutation in that case.
+        if (activeSession != null || recognitionSession != null || CustomerSessionHolder.current != null) {
+            return
+        }
+
         when (recognition.optString("recognition_status")) {
             "confirmed" -> {
                 val personId = recognition.optString("person_id")
@@ -118,6 +134,21 @@ class PreviewClient(private val baseUrl: String = BuildConfig.SERVER_URL) {
                 HudStateHolder.mutate { it.copy(statusLine = "recognizing", customerCard = null) }
             }
         }
+    }
+
+    private fun applyActiveSession(session: JSONObject) {
+        val sessionId = session.optString("session_id")
+        val customerId = session.optString("customer_id")
+        if (sessionId.isBlank() || customerId.isBlank()) return
+        CustomerSessionHolder.activate(
+            CustomerSessionState(
+                sessionId = sessionId,
+                customerId = customerId,
+                name = session.optString("name").ifBlank { customerId },
+                isNewCustomer = session.optBoolean("is_new_customer", false),
+                memoryCard = session.optString("memory_card"),
+            ),
+        )
     }
 
     private fun bumpError(reason: String) {

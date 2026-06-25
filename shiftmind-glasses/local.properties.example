@@ -26,6 +26,12 @@ shiftmind.previewFps=5
 # developer.android.com/reference/android/view/KeyEvent
 shiftmind.recordingKey=66
 
+# Optional: Android KeyEvent.KEYCODE that stops the active customer session
+# voice/transcript flow. Keep this different from shiftmind.recordingKey so
+# AR recording can run across the whole experiment while sessions end inside it.
+# Default 23 = KEYCODE_DPAD_CENTER.
+shiftmind.sessionKey=23
+
 # Optional: extra rotation applied to the camera texture before encoding.
 # Default -90 matches the server preview rotation: raw 640x480 sensor input
 # encoded upright into 480x640. If a future Rokid model tilts the recording,

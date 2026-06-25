@@ -14,6 +14,7 @@ BASE_DIR = Path(__file__).resolve().parent
 DATA_DIR = BASE_DIR / "data"
 SQLITE_PATH = DATA_DIR / "shiftmind.sqlite3"
 FACES_DIR = DATA_DIR / "faces"
+AUDIO_DIR = DATA_DIR / "audio"
 
 
 @dataclass(frozen=True)
@@ -31,6 +32,7 @@ class Storage:
         self.path = path
         DATA_DIR.mkdir(parents=True, exist_ok=True)
         FACES_DIR.mkdir(parents=True, exist_ok=True)
+        AUDIO_DIR.mkdir(parents=True, exist_ok=True)
         self._init_db()
 
     def connect(self) -> sqlite3.Connection:
@@ -67,6 +69,19 @@ class Storage:
                     similarity REAL,
                     margin REAL,
                     created_at TEXT NOT NULL
+                );
+
+                CREATE TABLE IF NOT EXISTS customer_sessions (
+                    id TEXT PRIMARY KEY,
+                    customer_id TEXT NOT NULL REFERENCES customers(id),
+                    status TEXT NOT NULL,
+                    is_new_customer INTEGER NOT NULL DEFAULT 0,
+                    transcript TEXT NOT NULL DEFAULT '',
+                    summary TEXT NOT NULL DEFAULT '',
+                    important_points_json TEXT NOT NULL DEFAULT '[]',
+                    audio_path TEXT,
+                    started_at TEXT NOT NULL,
+                    ended_at TEXT
                 );
                 """
             )
@@ -159,6 +174,137 @@ class Storage:
                 LIMIT ?
                 """,
                 (limit,),
+            ).fetchall()
+        return [dict(row) for row in rows]
+
+    def create_customer_session(self, *, customer_id: str, is_new_customer: bool) -> dict[str, Any]:
+        session_id = f"session-{uuid.uuid4().hex}"
+        now = _now_iso()
+        with self.connect() as conn:
+            conn.execute(
+                """
+                INSERT INTO customer_sessions (id, customer_id, status, is_new_customer, started_at)
+                VALUES (?, ?, 'active', ?, ?)
+                """,
+                (session_id, customer_id, 1 if is_new_customer else 0, now),
+            )
+        return self.get_customer_session(session_id) or {
+            "id": session_id,
+            "customer_id": customer_id,
+            "status": "active",
+            "is_new_customer": 1 if is_new_customer else 0,
+            "started_at": now,
+        }
+
+    def get_customer_session(self, session_id: str) -> dict[str, Any] | None:
+        with self.connect() as conn:
+            row = conn.execute(
+                """
+                SELECT s.*, c.name AS customer_name, c.memory_card
+                FROM customer_sessions s
+                JOIN customers c ON c.id = s.customer_id
+                WHERE s.id = ?
+                """,
+                (session_id,),
+            ).fetchone()
+        return dict(row) if row else None
+
+    def latest_active_session(self) -> dict[str, Any] | None:
+        with self.connect() as conn:
+            row = conn.execute(
+                """
+                SELECT s.*, c.name AS customer_name, c.memory_card
+                FROM customer_sessions s
+                JOIN customers c ON c.id = s.customer_id
+                WHERE s.status = 'active'
+                ORDER BY s.started_at DESC
+                LIMIT 1
+                """
+            ).fetchone()
+        return dict(row) if row else None
+
+    def abort_active_sessions(self) -> int:
+        """Mark any lingering 'active' sessions as 'aborted'.
+
+        Called on server startup so a session that never received a finish
+        (server killed mid-interaction) does not get resurrected on the next
+        frame and falsely re-confirm the last customer.
+        """
+        with self.connect() as conn:
+            cur = conn.execute(
+                "UPDATE customer_sessions SET status = 'aborted', ended_at = ? "
+                "WHERE status = 'active'",
+                (_now_iso(),),
+            )
+            return cur.rowcount
+
+
+    def finish_customer_session(
+        self,
+        *,
+        session_id: str,
+        transcript: str,
+        summary: str,
+        important_points: list[str],
+        audio_bytes: bytes | None,
+    ) -> dict[str, Any]:
+        session = self.get_customer_session(session_id)
+        if not session:
+            raise KeyError(session_id)
+        audio_path = None
+        if audio_bytes:
+            path = AUDIO_DIR / f"{session_id}.wav"
+            path.write_bytes(audio_bytes)
+            audio_path = str(path.relative_to(BASE_DIR))
+        with self.connect() as conn:
+            conn.execute(
+                """
+                UPDATE customer_sessions
+                SET status = 'ended',
+                    transcript = ?,
+                    summary = ?,
+                    important_points_json = ?,
+                    audio_path = COALESCE(?, audio_path),
+                    ended_at = ?
+                WHERE id = ?
+                """,
+                (
+                    transcript,
+                    summary,
+                    json.dumps(important_points, ensure_ascii=False),
+                    audio_path,
+                    _now_iso(),
+                    session_id,
+                ),
+            )
+        return self.get_customer_session(session_id) or {}
+
+    def recent_sessions(self, limit: int = 20) -> list[dict[str, Any]]:
+        with self.connect() as conn:
+            rows = conn.execute(
+                """
+                SELECT s.*, c.name AS customer_name
+                FROM customer_sessions s
+                JOIN customers c ON c.id = s.customer_id
+                ORDER BY s.started_at DESC
+                LIMIT ?
+                """,
+                (limit,),
+            ).fetchall()
+        return [dict(row) for row in rows]
+
+    def get_customer_session_history(self, customer_id: str, limit: int = 5) -> list[dict[str, Any]]:
+        """Get recent sessions for a customer to provide context for memory card updates."""
+        with self.connect() as conn:
+            rows = conn.execute(
+                """
+                SELECT summary, important_points_json, started_at
+                FROM customer_sessions
+                WHERE customer_id = ? AND status = 'ended' AND summary != ''
+                ORDER BY started_at DESC
+                LIMIT ?
+                """,
+                (customer_id, limit),
             ).fetchall()
         return [dict(row) for row in rows]
 

@@ -28,7 +28,9 @@ from fastapi.responses import HTMLResponse, StreamingResponse
 from pydantic import BaseModel, Field
 
 from face_recognition_service import get_face_service, normalize_face_crop_jpeg
+from session_service import session_service
 from state import latest_face_crop, latest_frame, latest_hud_state, latest_recognition_state
+from storage import storage
 
 router = APIRouter()
 
@@ -111,7 +113,18 @@ def _draw_hud_overlay(img: np.ndarray) -> None:
     if not state:
         state = {"title": "ShiftMind", "statusLine": "awaiting customer", "recordingActive": False}
     recog, _, _ = latest_recognition_state.read()
-    if recog.get("recognition_status") in {"confirmed", "unrecognized_first_visit"}:
+    active_session = session_service.active()
+    if active_session:
+        live = session_service.live_transcript(active_session.session_id)
+        transcript_line = str(live.get("partial_text") or live.get("final_text") or "").strip()
+        state = dict(state)
+        state["statusLine"] = f"session {active_session.customer_id}"
+        state["recordingActive"] = True
+        state["customerCard"] = {
+            "name": active_session.name if not active_session.is_new_customer else "First visit",
+            "memoryLine": transcript_line[-140:] or active_session.memory_card or "listening",
+        }
+    elif recog.get("recognition_status") in {"confirmed", "unrecognized_first_visit"}:
         state = dict(state)
         if recog.get("recognition_status") == "confirmed":
             person_id = str(recog.get("person_id") or "")
@@ -241,17 +254,22 @@ async def preview_frame(
     latest_frame.write(jpeg)
     face_bytes = await face_crop.read() if face_crop is not None else b""
     recognition = None
-    if face_bytes:
+    active_session = session_service.active()
+    if face_bytes and active_session is None:
         face_bytes = normalize_face_crop_jpeg(face_bytes)
         latest_face_crop.write(face_bytes, face_box)
         result = await asyncio.to_thread(get_face_service().recognize, face_bytes)
         recognition = result.to_dict()
+        active_session = await asyncio.to_thread(session_service.ensure_from_recognition, result, face_bytes)
+        if active_session:
+            recognition["active_session"] = active_session.to_dict()
         latest_recognition_state.write(recognition)
     return {
         "received": True,
         "bytes": len(jpeg),
         "face_crop": bool(face_bytes),
         "recognition": recognition or latest_recognition_state.read()[0],
+        "active_session": active_session.to_dict() if active_session else None,
     }
 
 
@@ -268,6 +286,7 @@ async def preview_status() -> dict:
     hud, hud_ts, hud_seq = latest_hud_state.read()
     face, face_box, face_ts, face_seq = latest_face_crop.read()
     recognition, recognition_ts, recognition_seq = latest_recognition_state.read()
+    active_session = session_service.active()
     return {
         "have_frame": jpeg is not None,
         "seq": seq,
@@ -281,7 +300,46 @@ async def preview_status() -> dict:
         "face_age_seconds": (time.monotonic() - face_ts) if face is not None else None,
         "recognition_seq": recognition_seq,
         "recognition_age_seconds": (time.monotonic() - recognition_ts) if recognition_ts else None,
+        "active_session": active_session.to_dict() if active_session else None,
         **recognition,
+    }
+
+
+@router.get("/api/preview-session")
+async def preview_session() -> dict:
+    """Session info panel data for the preview page.
+
+    Surfaces the active session's live transcript + the recognized customer's
+    stored memory_card and important_points (the latter pulled from the most
+    recent ended session row, since points are saved per-session).
+    """
+    import json
+
+    active = session_service.active()
+    if not active:
+        return {"active": False}
+
+    live = session_service.live_transcript(active.session_id)
+    transcript_line = str(live.get("partial_text") or live.get("final_text") or "").strip()
+
+    # important_points are stored per-session; pull the latest ended session's points.
+    history = storage.get_customer_session_history(active.customer_id, limit=1)
+    important_points: list[str] = []
+    if history:
+        try:
+            important_points = json.loads(history[0].get("important_points_json") or "[]")
+        except Exception:
+            important_points = []
+
+    return {
+        "active": True,
+        "session_id": active.session_id,
+        "customer_id": active.customer_id,
+        "name": active.name,
+        "is_new_customer": active.is_new_customer,
+        "memory_card": active.memory_card,
+        "important_points": important_points,
+        "live_transcript": transcript_line,
     }
 
 
@@ -357,12 +415,54 @@ flex-direction:column;align-items:center;padding:12px}
 main{display:flex;gap:16px;align-items:flex-start;justify-content:center;flex-wrap:wrap}
 section{display:flex;flex-direction:column;align-items:center;gap:8px}
 img{max-width:100%;height:auto;border:1px solid #0f0}
-.face{width:220px;min-height:160px;object-fit:contain}</style></head>
+.face{width:220px;min-height:160px;object-fit:contain}
+.panel{width:300px;border:1px solid #0f0;padding:12px;text-align:left;box-sizing:border-box}
+.panel h4{margin:0 0 8px;color:#0f0;border-bottom:1px solid #034;padding-bottom:4px}
+.panel .label{color:#6f6;font-size:11px;margin-top:10px;text-transform:uppercase;letter-spacing:1px}
+.panel .value{color:#eee;font-size:13px;margin-top:2px;word-wrap:break-word}
+.panel ul{margin:4px 0 0;padding-left:18px}
+.panel li{color:#cfc;font-size:12px;margin:2px 0}
+.panel .idle{color:#666;font-style:italic}
+.live{color:#fff !important}</style></head>
 <body><h3>shiftmind live preview + HUD</h3>
 <main>
   <section><strong>HUD preview</strong><img src="/api/preview-hud" alt="live MJPEG stream with HUD" /></section>
   <section><strong>face crop</strong><img class="face" src="/api/preview-face" alt="latest detected face crop" /></section>
+  <section><strong>session info</strong>
+    <div class="panel" id="session-panel">
+      <h4>Session</h4>
+      <div class="idle" id="session-body">no active session</div>
+    </div>
+  </section>
 </main>
 <p><a href="/api/preview">raw preview</a> · <a href="/api/faces.html">faces debug</a> · POST JPEGs to <code>/api/preview-frame</code> and HUD JSON to <code>/api/hud-state</code>.</p>
+<script>
+function esc(s){return String(s||"").replace(/[&<>]/g,c=>({"&":"&amp;","<":"&lt;",">":"&gt;"}[c]));}
+async function refreshSession(){
+  try{
+    const r = await fetch("/api/preview-session");
+    const d = await r.json();
+    const body = document.getElementById("session-body");
+    if(!d.active){
+      body.className = "idle";
+      body.textContent = "no active session";
+      return;
+    }
+    body.className = "";
+    const points = (d.important_points||[]).map(p=>`<li>${esc(p)}</li>`).join("");
+    body.innerHTML =
+      `<div class="label">Customer</div>`+
+      `<div class="value">${esc(d.name)} (${esc(d.customer_id)})${d.is_new_customer?" · NEW":""}</div>`+
+      `<div class="label">Memory Card</div>`+
+      `<div class="value">${esc(d.memory_card)||"<span class=idle>none yet</span>"}</div>`+
+      `<div class="label">Important Points</div>`+
+      (points?`<ul>${points}</ul>`:`<div class="value idle">none yet</div>`)+
+      `<div class="label">Live Transcript</div>`+
+      `<div class="value live">${esc(d.live_transcript)||"<span class=idle>listening...</span>"}</div>`;
+  }catch(e){ /* keep last good render */ }
+}
+refreshSession();
+setInterval(refreshSession, 1000);
+</script>
 </body></html>"""
     return HTMLResponse(html)

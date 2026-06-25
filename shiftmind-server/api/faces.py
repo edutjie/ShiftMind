@@ -40,6 +40,7 @@ async def faces_html() -> HTMLResponse:
     _, face_box, face_ts, face_seq = latest_face_crop.read()
     customers = storage.list_customers()
     events = storage.recent_events(20)
+    sessions = storage.recent_sessions(20)
     diag = face_service_status()
     customer_names = {c.id: c.name for c in customers}
     embedding_points = _embedding_points()
@@ -53,6 +54,12 @@ async def faces_html() -> HTMLResponse:
         f"<td>{_fmt(e.get('similarity'))}</td><td>{_fmt(e.get('margin'))}</td></tr>"
         for e in events
     ) or "<tr><td colspan='5'>no events yet</td></tr>"
+    session_rows = "\n".join(
+        f"<tr><td>{_e(s['started_at'])}</td><td>{_e(s['status'])}</td><td>{_e(s['customer_id'])}</td>"
+        f"<td>{_e(s.get('customer_name'))}</td><td>{_e(s.get('summary'))}</td>"
+        f"<td>{_points(s.get('important_points_json'))}</td></tr>"
+        for s in sessions
+    ) or "<tr><td colspan='6'>no sessions yet</td></tr>"
     recog_items = "".join(f"<li><b>{_e(k)}</b>: {_e(v)}</li>" for k, v in recog.items())
     diag_items = "".join(f"<li><b>{_e(k)}</b>: {_e(v)}</li>" for k, v in diag.items())
     embedding_svg = _render_embedding_svg(embedding_points, customer_names)
@@ -98,6 +105,7 @@ svg{{width:100%;max-width:620px;height:auto;border:1px solid #063;background:#00
     <p class="muted">PCA debug projection of Milvus Lite vectors; distance here is approximate for inspection.</p>
     <table><tr><th>embedding</th><th>customer_id</th><th>name</th><th>model</th><th>quality</th><th>norm</th><th>created</th></tr>{embedding_rows}</table>
     <h3>customers</h3><table><tr><th>id</th><th>name</th><th>memory_card</th><th>updated</th></tr>{rows}</table>
+    <h3>sessions</h3><table><tr><th>started</th><th>status</th><th>customer</th><th>name</th><th>summary</th><th>important points</th></tr>{session_rows}</table>
     <h3>recent events</h3><table><tr><th>time</th><th>status</th><th>candidate</th><th>similarity</th><th>margin</th></tr>{event_rows}</table>
   </section>
 </main>
@@ -116,6 +124,22 @@ def _short(value: object) -> str:
 
 def _fmt(value: object) -> str:
     return "" if value is None else f"{float(value):.3f}"
+
+
+def _points(value: object) -> str:
+    """Render important_points_json as a compact bullet list."""
+    if not value:
+        return ""
+    try:
+        import json
+
+        points = json.loads(str(value))
+    except Exception:
+        return _e(value)
+    if not isinstance(points, list) or not points:
+        return ""
+    items = "".join(f"<li>{_e(p)}</li>" for p in points)
+    return f"<ul style='margin:0;padding-left:16px'>{items}</ul>"
 
 
 def _fmt_age(ts: float) -> str:

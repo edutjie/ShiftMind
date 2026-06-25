@@ -20,12 +20,19 @@ import com.shiftmind.glasses.camera.CameraPreviewStreamer
 import com.shiftmind.glasses.hud.HudScreen
 import com.shiftmind.glasses.hud.HudStateHolder
 import com.shiftmind.glasses.net.HudStateClient
+import com.shiftmind.glasses.net.SessionAudioStreamClient
+import com.shiftmind.glasses.net.SessionClient
 import com.shiftmind.glasses.recording.ArRecorder
 import com.shiftmind.glasses.recording.RecordingStateReceiver
 import com.shiftmind.glasses.recording.RokidHudRecorder
+import com.shiftmind.glasses.recording.VoiceSessionRecorder
 import com.shiftmind.glasses.service.GlassesService
+import com.shiftmind.glasses.session.CustomerSessionHolder
+import com.shiftmind.glasses.session.CustomerSessionState
 import com.shiftmind.glasses.ui.theme.GlassHudTheme
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.Job
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 import java.text.SimpleDateFormat
@@ -38,6 +45,9 @@ class MainActivity : ComponentActivity() {
     private val recorder by lazy { ArRecorder(applicationContext, streamer, extraRotationDeg = BuildConfig.RECORDING_ROTATION_DEG) }
     private val hudRecorder by lazy { RokidHudRecorder(applicationContext) }
     private val hudStateClient by lazy { HudStateClient() }
+    private val sessionClient by lazy { SessionClient() }
+    private val sessionAudioStreamClient by lazy { SessionAudioStreamClient() }
+    private val voiceSessionRecorder by lazy { VoiceSessionRecorder(applicationContext) }
 
     // External AR recorder (Rokid mix_record from OverlayRec etc.) is no longer
     // expected to be used now that ShiftMind has its own recorder — but if
@@ -53,6 +63,7 @@ class MainActivity : ComponentActivity() {
     )
 
     private var screenWakeLock: PowerManager.WakeLock? = null
+    private var transcriptClearJob: Job? = null
 
     private val cameraPermissionRequest = registerForActivityResult(
         ActivityResultContracts.RequestPermission(),
@@ -102,10 +113,15 @@ class MainActivity : ComponentActivity() {
         recordingReceiver.register(this)
         hudRecorder.observeStateBroadcasts()
         startHudStateMirror()
+        startCustomerSessionWatcher()
         ensureCameraPermission()
         ensureAudioPermission()
 
         Log.i(TAG, "recording trigger key = ${BuildConfig.RECORDING_KEY} (${KeyEvent.keyCodeToString(BuildConfig.RECORDING_KEY)})")
+        Log.i(TAG, "session stop key = ${BuildConfig.SESSION_KEY} (${KeyEvent.keyCodeToString(BuildConfig.SESSION_KEY)})")
+        if (BuildConfig.RECORDING_KEY == BuildConfig.SESSION_KEY) {
+            Log.w(TAG, "recordingKey and sessionKey are the same; set shiftmind.sessionKey to a different physical button")
+        }
     }
 
     override fun onResume() {
@@ -119,6 +135,10 @@ class MainActivity : ComponentActivity() {
         if (recorder.isRecording) {
             Log.i(TAG, "activity paused while recording — finalizing MP4")
             stopRecording()
+        }
+        if (voiceSessionRecorder.isRecording) {
+            Log.i(TAG, "activity paused while customer session active — finalizing voice session")
+            stopCustomerSession()
         }
         streamer.stop()
         super.onPause()
@@ -141,6 +161,10 @@ class MainActivity : ComponentActivity() {
             if (event.keyCode == BuildConfig.RECORDING_KEY) {
                 onRecordingButtonPressed()
                 return true   // consume — don't let system also process this key
+            }
+            if (event.keyCode == BuildConfig.SESSION_KEY) {
+                onSessionButtonPressed()
+                return true
             }
         }
         return super.dispatchKeyEvent(event)
@@ -182,10 +206,99 @@ class MainActivity : ComponentActivity() {
         Log.i(TAG, "● Recording started: cam_stem=$ts, hud=screenstream")
     }
 
+    private fun onSessionButtonPressed() {
+        if (CustomerSessionHolder.current == null && !voiceSessionRecorder.isRecording) {
+            Toast.makeText(this, "No active customer session", Toast.LENGTH_SHORT).show()
+            return
+        }
+        stopCustomerSession()
+        Toast.makeText(this, "■ Customer session saved", Toast.LENGTH_SHORT).show()
+    }
+
     /** Stop camera recorder + tell screenstream to stop the HUD recorder. */
     private fun stopRecording() {
         if (recorder.isRecording) recorder.stop()
         hudRecorder.stop()
+    }
+
+    private fun startCustomerSessionWatcher() {
+        lifecycleScope.launch {
+            CustomerSessionHolder.stateFlow.collect { session ->
+                if (session == null) return@collect
+                startCustomerSession(session)
+            }
+        }
+    }
+
+    private fun startCustomerSession(session: CustomerSessionState) {
+        HudStateHolder.mutate {
+            it.copy(
+                statusLine = "session ${session.customerId}",
+                recordingActive = recorder.isRecording,
+                customerCard = com.shiftmind.glasses.hud.CustomerCard(
+                    name = if (session.isNewCustomer) "First visit" else session.name,
+                    lastVisit = null,
+                    memoryLine = session.memoryCard.ifBlank { null },
+                    liveTranscript = "listening...",
+                ),
+            )
+        }
+        sessionAudioStreamClient.onTranscript = { text, _ ->
+            val line = text.takeLast(140)
+            if (line.isNotBlank()) {
+                transcriptClearJob?.cancel()
+                HudStateHolder.mutate {
+                    it.copy(
+                        customerCard = it.customerCard?.copy(liveTranscript = line),
+                    )
+                }
+                // Hold the last spoken line on the HUD; only fall back to
+                // "listening..." after a few seconds of silence so words don't
+                // flash and vanish the moment a partial clears.
+                transcriptClearJob = lifecycleScope.launch {
+                    delay(TRANSCRIPT_HOLD_MS)
+                    HudStateHolder.mutate {
+                        it.copy(
+                            customerCard = it.customerCard?.copy(liveTranscript = "listening..."),
+                        )
+                    }
+                }
+            }
+        }
+        sessionAudioStreamClient.start(session.sessionId)
+        if (!voiceSessionRecorder.isRecording) {
+            val started = voiceSessionRecorder.start { chunk ->
+                sessionAudioStreamClient.sendPcm(chunk)
+            }
+            if (!started) {
+                Log.w(TAG, "customer session active but voice recorder did not start")
+            }
+        }
+    }
+
+    private fun stopCustomerSession() {
+        transcriptClearJob?.cancel()
+        val session = CustomerSessionHolder.current
+        val wav = voiceSessionRecorder.stopWav()
+        val transcript = sessionAudioStreamClient.stop()
+        if (session == null) {
+            HudStateHolder.mutate { it.copy(recordingActive = recorder.isRecording, statusLine = "awaiting customer", customerCard = null) }
+            return
+        }
+        HudStateHolder.mutate { it.copy(statusLine = "summarizing session", recordingActive = recorder.isRecording) }
+        lifecycleScope.launch(Dispatchers.IO) {
+            val ok = sessionClient.finishSession(session.sessionId, wav, transcript)
+            CustomerSessionHolder.clear(session.sessionId)
+            withContext(Dispatchers.Main) {
+                HudStateHolder.mutate {
+                    it.copy(
+                        statusLine = if (ok) "awaiting customer" else "session upload failed",
+                        customerCard = null,
+                        recordingActive = recorder.isRecording,
+                    )
+                }
+            }
+        }
     }
 
     private fun hasCameraPerm(): Boolean = ContextCompat.checkSelfPermission(
@@ -241,6 +354,7 @@ class MainActivity : ComponentActivity() {
     }
 
     override fun onDestroy() {
+        if (voiceSessionRecorder.isRecording) stopCustomerSession()
         if (recorder.isRecording) stopRecording()
         hudRecorder.stopObservingStateBroadcasts()
         recordingReceiver.unregister(this)
@@ -251,6 +365,7 @@ class MainActivity : ComponentActivity() {
 
     companion object {
         private const val TAG = "ShiftMind.Main"
+        private const val TRANSCRIPT_HOLD_MS = 6_000L
         private const val WAKE_LOCK_TIMEOUT_MS = 4L * 60L * 60L * 1000L
     }
 }
