@@ -95,6 +95,28 @@ Data lives under `shiftmind-server/data/` and is gitignored:
 - `faces/*.jpg` — saved enrollment crops.
 - `audio/*.wav` — uploaded customer-session voice recordings.
 
+## Session memory model
+
+ShiftMind keeps per-interaction notes separate from the long-lived memory card:
+
+| Field | Scope | Purpose |
+| :--- | :--- | :--- |
+| `customer_sessions.summary` | One session | Immutable summary of the completed interaction. |
+| `customer_sessions.important_points_json` | One session | Extracted facts from that interaction. |
+| `customers.memory_card` | Customer lifetime | Concise cumulative memory shown on the glasses HUD. |
+
+At session finish, the server uses the configured OpenAI-compatible chat
+completion API to summarize the transcript as JSON, then re-summarizes the
+cumulative `customers.memory_card` so it stays short enough for AR display.
+If LLM credentials are missing or unavailable, the fallback keeps a bounded
+summary rather than appending unbounded raw transcripts.
+
+The glasses HUD treats stored memory and current speech as separate surfaces:
+`CustomerCard.memoryLine` is previous-session memory, while
+`CustomerCard.liveTranscript` is only the current session transcript. Do not
+reuse one field for both, or the HUD will flicker between old memory and live
+speech.
+
 ## Dev tool — feed webcam into the preview pipeline
 
 Before the glasses Camera2 client is built, validate the preview end-to-end with the laptop webcam:
@@ -122,6 +144,16 @@ curl http://localhost:8000/api/preview-status
 uv run python tools/feed_webcam.py
 open http://localhost:8000/api/preview.html      # macOS; or paste into browser
 ```
+
+## Tests
+
+```bash
+uv run pytest
+RUN_LIVE_SESSION_TEST=1 uv run pytest tests/test_live_session.py
+```
+
+The live-session test is opt-in because it needs a running server on
+`localhost:8000` plus an active glasses customer session.
 
 ## What's NOT here yet
 

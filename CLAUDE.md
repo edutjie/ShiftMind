@@ -6,7 +6,8 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ShiftMind — AR-glasses shared-memory retrieval system for retail workers. Rokid Max Pro glasses surface a HUD "memory card" when a returning customer is recognized, plus live transcript triggers (product mentions, intent) during the interaction.
 
-**Status:** repo is empty. Next step is bootstrapping the two modules described under Architecture below.
+**Status:** repo now contains the glasses APK and laptop server modules. Keep
+the vault architecture docs as source of truth when changing architecture.
 
 ## Canonical design docs (read these before changing architecture)
 
@@ -53,6 +54,17 @@ Critical latency targets: face→HUD ~204 ms (achievable), audio→transcript ~1
 - **Dev networking via `adb reverse tcp:8000 tcp:8000`.** Glasses on USB can reach laptop server without shared WiFi by tunneling through adb. Set `shiftmind.serverUrl=http://127.0.0.1:8000` in `local.properties`. Re-run `adb reverse` after `adb kill-server`. For deployment we'll need actual WiFi.
 - **Video files stay on glasses.** Recordings are not uploaded over HTTP (too large). Pull manually from MediaStore `%ScreenRecorder%`.
 - **Server URL is build-time** (`BuildConfig.SERVER_URL` in `app/build.gradle.kts`). Phase-1 simplification — phase 4+ should move it to a runtime setting so users can change networks without rebuilding.
+- **Session memory contract.** Keep per-session summaries in
+  `customer_sessions.summary` / `important_points_json`; keep the cumulative HUD
+  card in `customers.memory_card`. Update the cumulative card by summarizing and
+  merging facts, not by appending raw transcripts forever.
+- **Stored memory vs live transcript are separate HUD fields.** `memoryLine` is
+  long-lived customer memory; `liveTranscript` is current speech. Do not route
+  live ASR text through `memoryLine`, or the HUD flickers between memory and
+  transcript.
+- **LLM summarization uses OpenAI-compatible chat completions JSON output.** Do
+  not swap back to an unverified Responses API call unless the SDK usage is
+  tested. Missing LLM credentials should degrade to bounded fallback summaries.
 
 ## Repo licensing (do not violate)
 
@@ -64,7 +76,7 @@ Critical latency targets: face→HUD ~204 ms (achievable), audio→transcript ~1
 
 ## Commands
 
-No build system yet — repo is empty. Once the modules exist:
+Use these module-local commands:
 
 **Glasses APK** (Android Studio project under `shiftmind-glasses/`):
 - `./gradlew :app:assembleDebug` — build debug APK
@@ -74,11 +86,11 @@ No build system yet — repo is empty. Once the modules exist:
 - `adb logcat -s ShiftMind:V` — filter logs
 
 **Laptop server** (`shiftmind-server/`):
-- `uvicorn server:app --host 0.0.0.0 --port 8000 --reload` — dev server (bind 0.0.0.0 so glasses on same WiFi can reach it)
-- `pip install -r requirements.txt` — install deps
-- `pytest` — run tests
-
-Update this section once the actual scripts exist.
+- `uv sync` — install deps from `pyproject.toml` / `uv.lock`
+- `./run.sh` — set up `adb reverse` and run uvicorn
+- `NO_ADB=1 ./run.sh` — run over WiFi or without connected glasses
+- `uv run pytest` — run server tests
+- `RUN_LIVE_SESSION_TEST=1 uv run pytest tests/test_live_session.py` — opt-in live test, requires running server and active glasses session
 
 ## Build order (per architecture_v2.md §"Priority order to build")
 
