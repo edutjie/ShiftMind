@@ -47,13 +47,15 @@ def _install_client(monkeypatch, script) -> _ScriptedCompletions:
 
     fake_client = SimpleNamespace(chat=SimpleNamespace(completions=comps))
     monkeypatch.setattr("session_service._openai_client", lambda: fake_client)
+    # _shorten_answer would otherwise make an extra (unscripted) LLM call at finalize.
+    monkeypatch.setattr(qa_service, "_shorten_answer", lambda q, a: "SHORT")
     return comps
 
 
 def test_loop_dispatches_both_tools_then_stops(monkeypatch):
     seen = []
 
-    def fake_vector(query, limit=5, employee_id=None, customer_id=None):
+    def fake_vector(query, limit=5, employee_id=None, customer_id=None, **_):
         seen.append(("vector_search", query))
         return {"hits": [{"session_id": "session-a", "customer_id": "person-001"}], "rowcount": 1, "_session_ids": ["session-a"]}
 
@@ -78,6 +80,8 @@ def test_loop_dispatches_both_tools_then_stops(monkeypatch):
     assert result["configured"] is True
     assert result["iterations"] == 3
     assert result["answer"] == "Five sessions mention returns."
+    assert result["short_answer"] == "SHORT"
+    assert len(result["short_answer"]) <= 140
     assert [s[0] for s in seen] == ["vector_search", "run_sql"]
     assert "session-a" in [s["session_id"] for s in result["sources"]]
     assert len(result["trace"]) == 2
@@ -123,3 +127,22 @@ def test_not_configured(monkeypatch):
     result = answer_question("q")
     assert result["configured"] is False
     assert "not configured" in result["answer"].lower()
+
+
+def test_truncate_plain_strips_markdown_and_caps():
+    from qa_service import _truncate_plain
+
+    md = "## Title\n\n- **bold** point one with many words here\n- `code` and *italic*"
+    out = _truncate_plain(md, 30)
+    assert "*" not in out and "#" not in out and "`" not in out
+    assert len(out) <= 30
+    assert out.endswith("…")
+
+
+def test_shorten_answer_falls_back_when_no_client(monkeypatch):
+    monkeypatch.setattr("session_service._openai_client", lambda: None)
+    from qa_service import _shorten_answer
+
+    out = _shorten_answer("q", "A long answer with **markdown** that must shrink to fit the HUD budget.")
+    assert len(out) <= 140
+    assert "*" not in out

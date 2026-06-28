@@ -110,11 +110,20 @@ class SessionMemoryService:
         limit: int = 5,
         employee_id: str | None = None,
         customer_id: str | None = None,
+        location_id: str | None = None,
+        created_at_min: int | None = None,
+        created_at_max: int | None = None,
     ) -> list[dict[str, Any]]:
         if self.count() == 0:
             return []
         vector = self.embed_text(query)
-        expr = _build_filter(employee_id=employee_id, customer_id=customer_id)
+        expr = _build_filter(
+            employee_id=employee_id,
+            customer_id=customer_id,
+            location_id=location_id,
+            created_at_min=created_at_min,
+            created_at_max=created_at_max,
+        )
         raw = self.client.search(
             collection_name=COLLECTION,
             data=[vector],
@@ -178,12 +187,25 @@ def _field(entity: Any, name: str) -> Any:
     return getattr(entity, name, None)
 
 
-def _build_filter(*, employee_id: str | None, customer_id: str | None) -> str | None:
+def _build_filter(
+    *,
+    employee_id: str | None,
+    customer_id: str | None,
+    location_id: str | None = None,
+    created_at_min: int | None = None,
+    created_at_max: int | None = None,
+) -> str | None:
     parts: list[str] = []
     if employee_id:
         parts.append(f'employee_id == "{employee_id}"')
     if customer_id:
         parts.append(f'customer_id == "{customer_id}"')
+    if location_id:
+        parts.append(f'location_id == "{location_id}"')
+    if created_at_min is not None:
+        parts.append(f"created_at >= {int(created_at_min)}")
+    if created_at_max is not None:
+        parts.append(f"created_at <= {int(created_at_max)}")
     return " and ".join(parts) or None
 
 

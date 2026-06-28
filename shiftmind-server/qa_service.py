@@ -126,6 +126,9 @@ TOOLS = [
                     "limit": {"type": "integer", "description": "Top-K matches (default 5, max 20).", "default": 5},
                     "employee_id": {"type": "string", "description": "Optional: restrict to sessions by this employee."},
                     "customer_id": {"type": "string", "description": "Optional: restrict to sessions by this customer."},
+                    "location_id": {"type": "string", "description": "Optional: restrict to sessions at this location/store."},
+                    "date_from": {"type": "string", "description": "Optional ISO date YYYY-MM-DD; only sessions started on/after it."},
+                    "date_to": {"type": "string", "description": "Optional ISO date YYYY-MM-DD; only sessions started on/before it."},
                 },
                 "required": ["query"],
             },
@@ -195,26 +198,77 @@ def _tool_run_sql(sql: str) -> dict[str, Any]:
 # ── tool: vector_search ────────────────────────────────────────────────────
 
 
+def _date_to_epoch(date_str: str | None, *, end: bool = False) -> int | None:
+    """'YYYY-MM-DD' (or ISO) -> epoch seconds. end=True -> 23:59:59 of that day."""
+    if not date_str:
+        return None
+    s = str(date_str).strip()
+    if len(s) == 10:  # YYYY-MM-DD
+        s = s + ("T23:59:59Z" if end else "T00:00:00Z")
+    try:
+        return int(time.mktime(time.strptime(s[:20], "%Y-%m-%dT%H:%M:%SZ")))
+    except (ValueError, TypeError):
+        return None
+
+
+def _simulated_session_ids(session_ids: list[str], want_sim: int) -> set[str]:
+    """Which of these session_ids have is_simulated == want_sim (0/1)."""
+    if not session_ids:
+        return set()
+    out: set[str] = set()
+    try:
+        with storage.connect() as conn:
+            placeholders = ",".join(["?"] * len(session_ids))
+            rows = conn.execute(
+                f"SELECT id FROM customer_sessions WHERE id IN ({placeholders}) AND is_simulated = ?",
+                (*session_ids, want_sim),
+            ).fetchall()
+        out = {str(r["id"]) for r in rows}
+    except sqlite3.Error:
+        pass
+    return out
+
+
 def _tool_vector_search(
     query: str,
     limit: int = 5,
     employee_id: str | None = None,
     customer_id: str | None = None,
+    location_id: str | None = None,
+    date_from: str | None = None,
+    date_to: str | None = None,
+    simulated: str = "all",
 ) -> dict[str, Any]:
-    """Semantic search over session_memories. Always returns a dict, never raises."""
+    """Semantic search over session_memories. Always returns a dict, never raises.
+
+    location/date are applied as Milvus expr (collection has those fields).
+    `simulated` is post-filtered against SQLite (the collection has no such field):
+    over-fetch limit*3 (capped at 20), drop non-matching session_ids, re-trim.
+    """
     if not (query or "").strip():
         return {"error": "empty query", "_rejected": True}
+    want_sim = None if simulated in (None, "", "all") else (1 if simulated == "sim" else 0)
+    fetch_limit = min(max(limit, 1) * 3, 20) if want_sim is not None else (limit or 5)
     try:
         from session_memory_service import get_memory_service
 
         hits = get_memory_service().search(
             query=query,
-            limit=limit or 5,
+            limit=fetch_limit,
             employee_id=employee_id,
             customer_id=customer_id,
+            location_id=location_id,
+            created_at_min=_date_to_epoch(date_from, end=False),
+            created_at_max=_date_to_epoch(date_to, end=True),
         )
     except Exception as exc:
         return {"error": f"vector_search_failed: {type(exc).__name__}: {exc}", "_rejected": False}
+
+    if want_sim is not None and hits:
+        keep = _simulated_session_ids(
+            [h.get("session_id") for h in hits if h.get("session_id")], want_sim
+        )
+        hits = [h for h in hits if h.get("session_id") in keep][: max(limit, 1)]
 
     names = _customer_names_for([h.get("customer_id") for h in hits if h.get("customer_id")])
     enriched = []
@@ -249,7 +303,14 @@ def _customer_names_for(customer_ids: list[str]) -> dict[str, str]:
 # ── dispatch ───────────────────────────────────────────────────────────────
 
 
-def _dispatch(name: str, args: dict[str, Any]) -> dict[str, Any]:
+def _dispatch(name: str, args: dict[str, Any], ui_filters: dict[str, Any] | None = None) -> dict[str, Any]:
+    ui = ui_filters or {}
+
+    def pick(key: str) -> str | None:
+        # UI filter wins when set; otherwise fall back to what the LLM passed.
+        v = ui.get(key)
+        return v if v not in (None, "", "all") else args.get(key)
+
     try:
         if name == "run_sql":
             return _tool_run_sql(str(args.get("sql", "")))
@@ -257,8 +318,12 @@ def _dispatch(name: str, args: dict[str, Any]) -> dict[str, Any]:
             return _tool_vector_search(
                 query=str(args.get("query", "")),
                 limit=int(args.get("limit", 5) or 5),
-                employee_id=args.get("employee_id"),
+                employee_id=pick("employee_id"),
                 customer_id=args.get("customer_id"),
+                location_id=pick("location_id"),
+                date_from=pick("date_from"),
+                date_to=pick("date_to"),
+                simulated=ui.get("simulated", "all"),
             )
         return {"error": f"unknown tool: {name}", "_rejected": True}
     except Exception as exc:  # never let a tool crash break the loop
@@ -268,8 +333,13 @@ def _dispatch(name: str, args: dict[str, Any]) -> dict[str, Any]:
 # ── agent loop ─────────────────────────────────────────────────────────────
 
 
-def answer_question(question: str, *, employee_id: str | None = None) -> dict[str, Any]:
-    """Run the tool-calling loop. Returns answer + trace + sources."""
+def answer_question(
+    question: str,
+    *,
+    employee_id: str | None = None,
+    filters: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    """Run the tool-calling loop. Returns answer + trace + sources + short_answer."""
     started = time.monotonic()
     from session_service import _openai_client
 
@@ -285,7 +355,7 @@ def answer_question(question: str, *, employee_id: str | None = None) -> dict[st
 
     model = os.getenv("SHIFTMIND_LLM_MODEL", "gpt-4o-mini")
     messages: list[dict[str, Any]] = [
-        {"role": "system", "content": _system_prompt(employee_id)},
+        {"role": "system", "content": _system_prompt(employee_id, filters)},
         {"role": "user", "content": question},
     ]
     collected = _empty_trace()
@@ -303,7 +373,12 @@ def answer_question(question: str, *, employee_id: str | None = None) -> dict[st
 
         tool_calls = getattr(msg, "tool_calls", None) or []
         if not tool_calls:
-            return _finalize(msg.content or "", collected, i + 1, started, configured=True)
+            answer = msg.content or ""
+            short = _shorten_answer(question, answer)
+            return _finalize(
+                answer, collected, i + 1, started,
+                configured=True, question=question, short_answer=short,
+            )
 
         for tc in tool_calls:
             name = tc.function.name
@@ -312,7 +387,7 @@ def answer_question(question: str, *, employee_id: str | None = None) -> dict[st
             except json.JSONDecodeError:
                 args = {"_raw_arguments": tc.function.arguments}
             t0 = time.monotonic()
-            result = _dispatch(name, args)
+            result = _dispatch(name, args, ui_filters=filters)
             elapsed_ms = int((time.monotonic() - t0) * 1000)
             collected["trace"].append(
                 {
@@ -331,13 +406,14 @@ def answer_question(question: str, *, employee_id: str | None = None) -> dict[st
                 content = content[:TOOL_RESULT_MAX_CHARS] + "…(truncated)"
             messages.append({"role": "tool", "tool_call_id": tc.id, "content": content})
 
-    return _finalize(
+    fallback = (
         "I couldn't fully answer that within the tool-call budget. Here's what I found so far:\n"
-        + _last_assistant_text(messages),
-        collected,
-        MAX_ITERATIONS,
-        started,
-        configured=True,
+        + _last_assistant_text(messages)
+    )
+    short = _shorten_answer(question, fallback)
+    return _finalize(
+        fallback, collected, MAX_ITERATIONS, started,
+        configured=True, question=question, short_answer=short,
     )
 
 
@@ -371,7 +447,40 @@ def _message_to_dict(msg: Any) -> dict[str, Any]:
     return d
 
 
-def _system_prompt(employee_id: str | None) -> str:
+def _filter_context(filters: dict[str, Any] | None) -> str:
+    """MANDATORY SCOPE block for run_sql (prompt-level; vector_search filters are applied in code)."""
+    if not filters:
+        return ""
+    f = {k: v for k, v in filters.items() if v not in (None, "", "all")}
+    if not f:
+        return ""
+    lines = [
+        "",
+        "",
+        "MANDATORY SCOPE — apply to EVERY run_sql query and every vector_search. Do NOT broaden:",
+    ]
+    if f.get("location_id"):
+        lines.append(f"  location_id == '{f['location_id']}'")
+    if f.get("employee_id"):
+        lines.append(f"  employee_id == '{f['employee_id']}'")
+    if f.get("topic"):
+        lines.append(
+            f"  topics_json must contain '{f['topic']}' "
+            f"(e.g. WHERE EXISTS (SELECT 1 FROM json_each(topics_json) WHERE value LIKE '%{f['topic']}%'))"
+        )
+    if f.get("date_from"):
+        lines.append(f"  started_at >= '{f['date_from']}T00:00:00Z'")
+    if f.get("date_to"):
+        lines.append(f"  started_at <= '{f['date_to']}T23:59:59Z'")
+    if f.get("simulated") == "real":
+        lines.append("  is_simulated == 0  (real data only)")
+    elif f.get("simulated") == "sim":
+        lines.append("  is_simulated == 1  (simulated data only)")
+    lines.append("If the result would be empty under this scope, say so — do NOT widen the scope.")
+    return "\n".join(lines)
+
+
+def _system_prompt(employee_id: str | None, filters: dict[str, Any] | None = None) -> str:
     prompt = (
         "You are ShiftMind's retail business-insight assistant. Employees ask you questions "
         "about past customer interactions collected by the AR-glasses system. Answer ONLY from "
@@ -386,6 +495,7 @@ def _system_prompt(employee_id: str | None) -> str:
     )
     if employee_id:
         prompt += f"\n\nThe asking employee is {employee_id}. Treat questions like 'my customers' as scoped to this employee_id unless the question says otherwise."
+    prompt += _filter_context(filters)
     return prompt
 
 
@@ -421,6 +531,56 @@ def _last_assistant_text(messages: list[dict[str, Any]]) -> str:
     return ""
 
 
+def _truncate_plain(text: str, n: int = 140) -> str:
+    """Strip markdown + collapse whitespace + word-boundary truncate. For the
+    glasses short_answer fallback (matches the liveTranscript 140-char budget)."""
+    s = re.sub(r"`+", "", str(text or ""))
+    s = re.sub(r"^#{1,6}\s*", "", s, flags=re.MULTILINE)
+    s = re.sub(r"^\s*[-*]\s+", "", s, flags=re.MULTILINE)
+    s = s.replace("*", "").replace("#", "")
+    s = re.sub(r"\s+", " ", s).strip()
+    if len(s) <= n:
+        return s
+    cut = s.rfind(" ", 0, n)
+    return (s[:cut] if cut > 0 else s[:n]).rstrip(",;.:") + "…"
+
+
+def _shorten_answer(question: str, full_answer: str) -> str:
+    """Distill the full answer into a ≤140-char plain-text line for the glasses HUD.
+
+    One LLM call; falls back to _truncate_plain on any failure or missing config.
+    """
+    full_answer = full_answer or ""
+    from session_service import _openai_client
+
+    client = _openai_client()
+    if client is None:
+        return _truncate_plain(full_answer, 140)
+    model = os.getenv("SHIFTMIND_LLM_MODEL", "gpt-4o-mini")
+    try:
+        resp = client.chat.completions.create(
+            model=model,
+            messages=[
+                {
+                    "role": "system",
+                    "content": (
+                        "Compress the answer into at most 140 characters of plain text for an AR "
+                        "glasses heads-up display. No markdown, no ellipsis padding, straight to "
+                        "the point. Include the single most important number or name. Answer the "
+                        "user's specific question directly."
+                    ),
+                },
+                {"role": "user", "content": f"Question: {question}\n\nAnswer:\n{full_answer}"},
+            ],
+            temperature=0.1,
+            max_tokens=60,
+        )
+        line = (resp.choices[0].message.content or "").replace("\n", " ").strip()
+        return _truncate_plain(line, 140)
+    except Exception:
+        return _truncate_plain(full_answer, 140)
+
+
 def _finalize(
     answer: str,
     collected: dict[str, Any],
@@ -428,9 +588,14 @@ def _finalize(
     started: float,
     *,
     configured: bool,
+    question: str = "",
+    short_answer: str = "",
 ) -> dict[str, Any]:
+    answer = answer.strip()
     return {
-        "answer": answer.strip(),
+        "answer": answer,
+        # glasses-ready line; compute lazily if the caller didn't precompute one
+        "short_answer": short_answer or _truncate_plain(answer, 140),
         "trace": collected.get("trace", []),
         "sources": _sources_for(list(collected.get("session_ids", set()))),
         "iterations": iterations,
@@ -476,3 +641,237 @@ def _sources_for(session_ids: list[str]) -> list[dict[str, Any]]:
     except sqlite3.Error:
         pass
     return out
+
+
+# ── stats / suggestions / snapshot ─────────────────────────────────────────
+
+
+def _collect_stats() -> dict[str, Any]:
+    """One SQLite connection, multiple executes. Powers suggestions + snapshot."""
+    stats: dict[str, Any] = {}
+    try:
+        with storage.connect() as conn:
+            tot = conn.execute(
+                "SELECT COUNT(*) total, SUM(status='ended') ended, SUM(status='active') active "
+                "FROM customer_sessions"
+            ).fetchone()
+            stats["total_sessions"] = int(tot["total"] or 0)
+            stats["ended_sessions"] = int(tot["ended"] or 0)
+            stats["active_sessions"] = int(tot["active"] or 0)
+
+            cr = conn.execute(
+                "SELECT SUM(outcome='converted')*1.0/COUNT(*) conv, AVG(duration_seconds) avg_dur "
+                "FROM customer_sessions WHERE status='ended'"
+            ).fetchone()
+            stats["conversion_rate"] = round(float(cr["conv"] or 0), 4)
+            stats["avg_duration_seconds"] = round(float(cr["avg_dur"] or 0), 1)
+
+            stats["outcome_breakdown"] = {
+                r["outcome"] or "unknown": int(r["n"])
+                for r in conn.execute(
+                    "SELECT outcome, COUNT(*) n FROM customer_sessions "
+                    "WHERE status='ended' GROUP BY outcome"
+                ).fetchall()
+            }
+            stats["top_topics"] = [
+                {"topic": r["value"], "n": int(r["n"])}
+                for r in conn.execute(
+                    "SELECT value, COUNT(*) n FROM customer_sessions, json_each(topics_json) "
+                    "WHERE status='ended' GROUP BY value ORDER BY n DESC LIMIT 8"
+                ).fetchall()
+            ]
+            stats["top_employees"] = [
+                {"name": r["name"], "n": int(r["n"]), "conv": round(float(r["conv"] or 0), 3)}
+                for r in conn.execute(
+                    "SELECT e.name name, COUNT(*) n, "
+                    "SUM(s.outcome='converted')*1.0/COUNT(*) conv "
+                    "FROM customer_sessions s JOIN employees e ON e.id=s.employee_id "
+                    "WHERE s.status='ended' GROUP BY e.name ORDER BY n DESC LIMIT 5"
+                ).fetchall()
+            ]
+            loc_rows = conn.execute(
+                "SELECT l.name name, COUNT(*) n, "
+                "SUM(s.outcome='converted')*1.0/COUNT(*) conv "
+                "FROM customer_sessions s JOIN locations l ON l.id=s.location_id "
+                "WHERE s.status='ended' GROUP BY l.name HAVING COUNT(*)>1 ORDER BY n DESC"
+            ).fetchall()
+            stats["top_locations"] = [
+                {"name": r["name"], "n": int(r["n"]), "conv": round(float(r["conv"] or 0), 3)}
+                for r in loc_rows
+            ]
+            if loc_rows:
+                stats["busiest_location"] = {"name": loc_rows[0]["name"], "n": int(loc_rows[0]["n"])}
+                # worst conversion among locations with >1 session
+                worst = min(loc_rows, key=lambda r: r["conv"] if r["conv"] is not None else 1.0)
+                stats["worst_location"] = {"name": worst["name"], "conv": round(float(worst["conv"] or 0), 3)}
+            sim = conn.execute(
+                "SELECT is_simulated, COUNT(*) n FROM customer_sessions "
+                "WHERE status='ended' GROUP BY is_simulated"
+            ).fetchall()
+            stats["simulated_breakdown"] = {
+                "real": int(next((r["n"] for r in sim if r["is_simulated"] == 0), 0)),
+                "sim": int(next((r["n"] for r in sim if r["is_simulated"] == 1), 0)),
+            }
+            dr = conn.execute(
+                "SELECT MIN(started_at) min, MAX(started_at) max FROM customer_sessions WHERE status='ended'"
+            ).fetchone()
+            stats["date_range"] = {"min": dr["min"], "max": dr["max"]}
+    except sqlite3.Error:
+        pass
+    return stats
+
+
+def _stats_summary(stats: dict[str, Any]) -> str:
+    """Compact text summary of the dataset, fed to the LLM for creative suggestions/narrative."""
+    parts = [
+        f"{stats.get('ended_sessions', 0)} ended sessions",
+        f"conversion rate {stats.get('conversion_rate', 0):.1%}",
+        f"avg duration {stats.get('avg_duration_seconds', 0):.0f}s",
+    ]
+    if stats.get("top_topics"):
+        parts.append("top topics: " + ", ".join(f"{t['topic']}({t['n']})" for t in stats["top_topics"][:5]))
+    if stats.get("top_employees"):
+        parts.append("busiest employees: " + ", ".join(f"{e['name']}({e['n']})" for e in stats["top_employees"][:3]))
+    if stats.get("top_locations"):
+        parts.append("locations: " + ", ".join(f"{l['name']}({l['n']},conv {l['conv']:.0%})" for l in stats["top_locations"][:3]))
+    sb = stats.get("simulated_breakdown", {})
+    parts.append(f"real/sim: {sb.get('real',0)}/{sb.get('sim',0)}")
+    return "; ".join(parts) + "."
+
+
+def _template_suggestions(stats: dict[str, Any]) -> list[str]:
+    out = ["What is the overall conversion rate?"]
+    topics = stats.get("top_topics") or []
+    if topics:
+        out.append(f"Why is {topics[0]['topic']} the most common topic?")
+        if len(topics) > 1:
+            out.append(f"Compare {topics[0]['topic']} vs {topics[1]['topic']} conversations")
+    emps = stats.get("top_employees") or []
+    if emps:
+        out.append(f"What does {emps[0]['name']} discuss most?")
+        out.append(f"Which employee has the best conversion rate?")
+    if stats.get("busiest_location"):
+        out.append(f"How does {stats['busiest_location']['name']} compare to other stores?")
+    if stats.get("worst_location"):
+        out.append(f"Why does {stats['worst_location']['name']} have the lowest conversion?")
+    sb = stats.get("simulated_breakdown") or {}
+    if sb.get("real", 0) and sb.get("sim", 0):
+        out.append("Compare real vs simulated conversion rates")
+    if stats.get("date_range", {}).get("min"):
+        out.append(f"What changed since {stats['date_range']['min'][:10]}?")
+    return out[:8]
+
+
+def _creative_suggestions(stats: dict[str, Any]) -> list[str]:
+    """LLM-generated question suggestions from the stats summary. Falls back to templates."""
+    from session_service import _openai_client
+
+    client = _openai_client()
+    if client is None:
+        return _template_suggestions(stats)
+    model = os.getenv("SHIFTMIND_LLM_MODEL", "gpt-4o-mini")
+    try:
+        resp = client.chat.completions.create(
+            model=model,
+            messages=[
+                {
+                    "role": "system",
+                    "content": (
+                        "You suggest insightful questions a retail employee might ask about THIS dataset. "
+                        "Given the stats, propose 4-6 specific, creative, non-generic questions tied to the "
+                        "actual numbers/names. Each ≤80 chars, plain text, no numbering, no quotes, no "
+                        "markdown. Return one question per line."
+                    ),
+                },
+                {"role": "user", "content": _stats_summary(stats)},
+            ],
+            temperature=0.6,
+            max_tokens=200,
+        )
+        lines = [
+            ln.strip().lstrip("0123456789.-) ").strip('"').strip()
+            for ln in (resp.choices[0].message.content or "").splitlines()
+        ]
+        lines = [ln for ln in lines if 5 <= len(ln) <= 80]
+        return lines[:6] or _template_suggestions(stats)
+    except Exception:
+        return _template_suggestions(stats)
+
+
+def get_suggestions(*, creative: bool = False) -> dict[str, Any]:
+    stats = _collect_stats()
+    suggestions = _creative_suggestions(stats) if creative else _template_suggestions(stats)
+    return {"suggestions": suggestions, "creative": creative, "stats_summary": _stats_summary(stats)}
+
+
+def _narrative(stats: dict[str, Any]) -> str:
+    """1 LLM call → 2-3 plain sentences summarizing the stats. Template fallback."""
+    from session_service import _openai_client
+
+    client = _openai_client()
+    if client is None:
+        return _narrative_fallback(stats)
+    model = os.getenv("SHIFTMIND_LLM_MODEL", "gpt-4o-mini")
+    try:
+        resp = client.chat.completions.create(
+            model=model,
+            messages=[
+                {
+                    "role": "system",
+                    "content": (
+                        "Summarize these retail session stats in 2-3 plain sentences for a store employee. "
+                        "Lead with the most notable number. Plain text, no markdown."
+                    ),
+                },
+                {"role": "user", "content": _stats_summary(stats)},
+            ],
+            temperature=0.3,
+            max_tokens=160,
+        )
+        return (resp.choices[0].message.content or "").strip() or _narrative_fallback(stats)
+    except Exception:
+        return _narrative_fallback(stats)
+
+
+def _narrative_fallback(stats: dict[str, Any]) -> str:
+    return (
+        f"{stats.get('ended_sessions',0)} sessions recorded "
+        f"with a {stats.get('conversion_rate',0):.0%} conversion rate. "
+        f"Top topic: {(stats.get('top_topics') or [{}])[0].get('topic','n/a')}."
+    )
+
+
+def get_snapshot(*, narrative: bool = False) -> dict[str, Any]:
+    stats = _collect_stats()
+    stats["narrative"] = _narrative(stats) if narrative else None
+    return stats
+
+
+def get_filter_options() -> dict[str, Any]:
+    """Dropdown options for the Q&A filter bar. Pure SQL."""
+    opts: dict[str, Any] = {"locations": [], "employees": [], "topics": [], "date_range": None}
+    try:
+        with storage.connect() as conn:
+            opts["locations"] = [
+                {"id": r["id"], "name": r["name"]}
+                for r in conn.execute("SELECT id, name FROM locations ORDER BY name").fetchall()
+            ]
+            opts["employees"] = [
+                {"id": r["id"], "name": r["name"]}
+                for r in conn.execute("SELECT id, name FROM employees ORDER BY name").fetchall()
+            ]
+            opts["topics"] = [
+                {"topic": r["value"], "n": int(r["n"])}
+                for r in conn.execute(
+                    "SELECT value, COUNT(*) n FROM customer_sessions, json_each(topics_json) "
+                    "WHERE status='ended' GROUP BY value ORDER BY n DESC LIMIT 15"
+                ).fetchall()
+            ]
+            dr = conn.execute(
+                "SELECT MIN(started_at) min, MAX(started_at) max FROM customer_sessions WHERE status='ended'"
+            ).fetchone()
+            if dr and dr["min"]:
+                opts["date_range"] = {"min": str(dr["min"])[:10], "max": str(dr["max"])[:10]}
+    except sqlite3.Error:
+        pass
+    return opts

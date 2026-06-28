@@ -87,7 +87,10 @@ SHIFTMIND_EMBED_DIM=1536                        # must match the model's output 
 | `/api/preview.html` | GET | Convenience page showing HUD preview + latest face crop. |
 | `/api/preview-status` | GET | Preview, face crop, and recognition status JSON. |
 | `/api/qa.html` | GET | Q&A agent page. Employee types a business-insight question; the agent calls `run_sql` / `vector_search` tools and renders the answer + tool trace + sources. |
-| `/api/qa/ask` | POST | JSON `{question}`. Runs the tool-calling loop, returns `{answer, trace, sources, iterations, elapsed_ms}`. |
+| `/api/qa/ask` | POST | JSON `{question, filters?}`. Runs the tool-calling loop, returns `{answer, short_answer, trace, sources, iterations, elapsed_ms}`. |
+| `/api/qa/filters` | GET | Dropdown options (locations, employees, top topics, date range) for the Q&A filter bar. |
+| `/api/qa/suggestions` | GET | Suggested-question chips from real DB stats. `?creative=1` for LLM-generated. |
+| `/api/qa/snapshot` | GET | Pre-baked stats dashboard (totals, conversion, top topics/employees/locations). `?narrative=1` adds an LLM summary. |
 
 ## Face recognition dev flow
 
@@ -139,7 +142,24 @@ history. An OpenAI-compatible chat loop picks between two tools per question:
   filters by employee/location/outcome/date). Driver-level `mode=ro` plus a
   statement guard and a 50-row cap; writes/DDL/multi-statement are rejected.
 - `vector_search` — semantic search over the `session_memories` Milvus
-  collection (topical/free-form recall).
+  collection (topical/free-form recall), filterable by employee/location/date.
+
+The page renders the agent's markdown answer (lists, bold, code), shows a
+tool-call trace + source sessions, and exposes:
+
+- **Filters** (location, employee, topic, date range, simulated/real toggle) —
+  passed to the agent as a MANDATORY SCOPE block for `run_sql` and applied
+  programmatically to `vector_search`. `GET /api/qa/filters` populates the
+  dropdowns from the live DB.
+- **Suggested questions** — generated from real DB stats (top topics, busiest
+  employee/location, worst-conversion store). "🎲 surprise me" asks the LLM for
+  creative suggestions tied to the dataset. `GET /api/qa/suggestions?creative=1`.
+- **Overview dashboard** — `GET /api/qa/snapshot?narrative=1` returns totals,
+  conversion rate, avg duration, top topics/employees/locations, and an LLM
+  narrative; rendered as stat cards.
+- **`short_answer`** — every `/api/qa/ask` response includes a ≤140-char
+  plain-text distillation for the eventual AR-glasses HUD (matches the
+  `liveTranscript` budget). Glasses-side rendering is a future change.
 
 Backfill older sessions (summarized before topics/outcome existed) with:
 
