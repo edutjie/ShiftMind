@@ -75,7 +75,7 @@ async def qa_html() -> HTMLResponse:
     else:
         login_line = "<span class='idle'>no employee logged in</span> · <a href='/api/login.html'>log in</a>"
 
-    html = """<!doctype html><html><head><title>ShiftMind Q&amp;A</title>
+    html = r"""<!doctype html><html><head><title>ShiftMind Q&amp;A</title>
 <style>
 body{margin:0;background:#000;color:#0f0;font:14px monospace;padding:16px;max-width:900px;margin:0 auto}
 h3{margin:0 0 8px}
