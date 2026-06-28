@@ -21,6 +21,10 @@ data class HudState(
     /** Subtitle / status line under the title. Null = hidden. */
     val statusLine: String? = "awaiting customer",
 
+    /** Logged-in employee + location for this shift (server web login). */
+    val employeeName: String? = null,
+    val locationName: String? = null,
+
     /** Customer "memory card" — populated when face-detect resolves a returning customer. */
     val customerCard: CustomerCard? = null,
 

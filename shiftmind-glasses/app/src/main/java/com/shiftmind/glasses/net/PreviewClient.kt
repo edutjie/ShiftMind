@@ -88,6 +88,12 @@ class PreviewClient(private val baseUrl: String = BuildConfig.SERVER_URL) {
         val root = runCatching { JSONObject(body) }.getOrNull() ?: return
         val activeSession = root.optJSONObject("active_session")
         activeSession?.let { applyActiveSession(it) }
+        val activeEmployee = root.optJSONObject("active_employee")
+        if (activeEmployee != null && activeEmployee.optBoolean("active", false)) {
+            val empName = activeEmployee.optString("employee_name").takeIf { it.isNotBlank() }
+            val locName = activeEmployee.optString("location_name").takeIf { it.isNotBlank() }
+            HudStateHolder.mutate { it.copy(employeeName = empName, locationName = locName) }
+        }
         val recognition = runCatching {
             root.optJSONObject("recognition")
         }.getOrNull() ?: return

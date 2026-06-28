@@ -27,6 +27,7 @@ from fastapi import APIRouter, File, Form, UploadFile
 from fastapi.responses import HTMLResponse, StreamingResponse
 from pydantic import BaseModel, Field
 
+from auth import active_login
 from face_recognition_service import get_face_service, normalize_face_crop_jpeg
 from session_service import session_service
 from state import latest_face_crop, latest_frame, latest_hud_state, latest_recognition_state
@@ -270,6 +271,7 @@ async def preview_frame(
         "face_crop": bool(face_bytes),
         "recognition": recognition or latest_recognition_state.read()[0],
         "active_session": active_session.to_dict() if active_session else None,
+        "active_employee": active_login.to_dict(),
     }
 
 
@@ -301,6 +303,7 @@ async def preview_status() -> dict:
         "recognition_seq": recognition_seq,
         "recognition_age_seconds": (time.monotonic() - recognition_ts) if recognition_ts else None,
         "active_session": active_session.to_dict() if active_session else None,
+        "active_employee": active_login.to_dict(),
         **recognition,
     }
 
@@ -409,6 +412,15 @@ async def preview_face():
 @router.get("/api/preview.html")
 async def preview_html() -> HTMLResponse:
     """Tiny convenience page so you can just click a link."""
+    login = active_login.to_dict()
+    if login.get("active"):
+        login_line = (
+            f"active employee: <b>{login['employee_name']}</b>"
+            f" @ <b>{login.get('location_name') or '—'}</b>"
+            f" · <a href='/api/login.html'>change</a>"
+        )
+    else:
+        login_line = "<span class='idle'>no employee logged in</span> · <a href='/api/login.html'>log in</a>"
     html = """<!doctype html><html><head><title>ShiftMind preview</title>
 <style>body{margin:0;background:#000;color:#0f0;font:14px monospace;display:flex;
 flex-direction:column;align-items:center;padding:12px}
@@ -424,7 +436,7 @@ img{max-width:100%;height:auto;border:1px solid #0f0}
 .panel li{color:#cfc;font-size:12px;margin:2px 0}
 .panel .idle{color:#666;font-style:italic}
 .live{color:#fff !important}</style></head>
-<body><h3>shiftmind live preview + HUD</h3>
+<body><h3>shiftmind live preview + HUD</h3><p>@@LOGIN@@</p>
 <main>
   <section><strong>HUD preview</strong><img src="/api/preview-hud" alt="live MJPEG stream with HUD" /></section>
   <section><strong>face crop</strong><img class="face" src="/api/preview-face" alt="latest detected face crop" /></section>
@@ -465,4 +477,4 @@ refreshSession();
 setInterval(refreshSession, 1000);
 </script>
 </body></html>"""
-    return HTMLResponse(html)
+    return HTMLResponse(html.replace("@@LOGIN@@", login_line))
