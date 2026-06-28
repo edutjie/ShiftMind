@@ -200,7 +200,7 @@ document.getElementById("clearf").onclick = () => {
 async function loadFilters(){
   try{
     const d = await (await fetch("/api/qa/filters")).json();
-    const opt = (v,l) => "<option value=\""+esc(v)+"\">"+esc(l)+"</option>";
+    const opt = (v,l) => '<option value="'+esc(v)+'">'+esc(l)+'</option>';
     (d.locations||[]).forEach(l => fLoc.insertAdjacentHTML("beforeend", opt(l.id, l.name)));
     (d.employees||[]).forEach(e => fEmp.insertAdjacentHTML("beforeend", opt(e.id, e.name)));
     (d.topics||[]).forEach(t => fTopic.insertAdjacentHTML("beforeend", opt(t.topic, t.topic+" ("+t.n+")")));
