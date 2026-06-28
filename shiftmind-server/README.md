@@ -146,6 +146,18 @@ Backfill older sessions (summarized before topics/outcome existed) with:
 ```bash
 uv run python -m scripts.backfill_qa --dry-run
 uv run python -m scripts.backfill_qa --limit 10
+uv run python -m scripts.backfill_qa --reindex   # re-embed ALL sessions into Milvus
+```
+
+`customer_sessions` / `customers` / `employees` carry an `is_simulated` flag
+(1 = seeded demo data, 0 = real capture). Simulated data is included in
+queries by default; the agent filters to `is_simulated = 0` only when you
+explicitly ask for "real"/"production" data. Normalize a legacy seed
+dataset's free-form outcomes onto the canonical enum and flag `sim-*` rows
+with:
+
+```bash
+uv run python -m scripts.normalize_sim_data
 ```
 
 The glasses HUD treats stored memory and current speech as separate surfaces:

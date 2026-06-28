@@ -101,6 +101,7 @@ class Storage:
             )
         self._migrate_add_employee_location_columns()
         self._migrate_add_qa_columns()
+        self._migrate_add_is_simulated()
 
     def _migrate_add_qa_columns(self) -> None:
         """Add Q&A-agent columns to customer_sessions.
@@ -117,6 +118,25 @@ class Storage:
                 ("outcome", "TEXT"),
                 ("duration_seconds", "REAL"),
             ],
+        }
+        with self.connect() as conn:
+            for table, cols in adds.items():
+                existing = {row["name"] for row in conn.execute(f"PRAGMA table_info({table})").fetchall()}
+                for col_name, col_def in cols:
+                    if col_name not in existing:
+                        conn.execute(f"ALTER TABLE {table} ADD COLUMN {col_name} {col_def}")
+
+    def _migrate_add_is_simulated(self) -> None:
+        """Add is_simulated flag to customers/employees/customer_sessions.
+
+        Idempotent + additive. Marks rows seeded by the simulation/dev dataset
+        (id prefix `sim-`) so the Q&A agent can distinguish demo data from real
+        production data captured by the glasses. Default 0 = real.
+        """
+        adds = {
+            "customers": [("is_simulated", "INTEGER NOT NULL DEFAULT 0")],
+            "employees": [("is_simulated", "INTEGER NOT NULL DEFAULT 0")],
+            "customer_sessions": [("is_simulated", "INTEGER NOT NULL DEFAULT 0")],
         }
         with self.connect() as conn:
             for table, cols in adds.items():

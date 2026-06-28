@@ -50,6 +50,62 @@ def _ended_sessions_needing_backfill(limit: int | None) -> list[dict]:
     return needy[:limit] if limit else needy
 
 
+def _all_ended_sessions(limit: int | None) -> list[dict]:
+    sql = (
+        "SELECT id, customer_id, employee_id, location_id, transcript, summary, "
+        "important_points_json, started_at, ended_at, topics_json, outcome "
+        "FROM customer_sessions WHERE status = 'ended'"
+    )
+    with storage.connect() as conn:
+        rows = [dict(r) for r in conn.execute(sql).fetchall()]
+    return rows[:limit] if limit else rows
+
+
+def reindex_memories(*, limit: int | None = None, dry_run: bool = False) -> dict:
+    """Re-embed every ended session into Milvus from stored summary+points.
+
+    Use after normalizing outcomes (or changing embedding model) to bring the
+    session_memories collection back in sync with SQLite. Does NOT touch SQL
+    columns. Re-embeds unconditionally (ignores has_session).
+    """
+    if _openai_client() is None:
+        print("[reindex] OPENAI_API_KEY not set — cannot embed.")
+        return {"embedded": 0, "errors": 0, "dry_run": dry_run, "no_key": True}
+
+    sessions = _all_ended_sessions(limit)
+    print(f"[reindex] {len(sessions)} session(s)" + (f" (limit {limit})" if limit else "") + (" [DRY RUN]" if dry_run else ""))
+
+    embedded = errors = 0
+    mem = get_memory_service()
+    for i, row in enumerate(sessions, 1):
+        sid = row["id"]
+        content = _build_content(row)
+        if not content or content.startswith("Session ended."):
+            continue
+        if dry_run:
+            continue
+        try:
+            mem.upsert_memory(
+                memory_id=f"mem-{sid}",
+                session_id=sid,
+                customer_id=str(row["customer_id"]),
+                employee_id=row["employee_id"],
+                location_id=row["location_id"],
+                content=content,
+                outcome=str(row["outcome"] or "unknown"),
+                started_at_iso=str(row["started_at"] or ""),
+            )
+            embedded += 1
+            if i % 25 == 0:
+                print(f"  [{i}/{len(sessions)}] re-embedded")
+        except Exception as exc:
+            errors += 1
+            print(f"  [{i}/{len(sessions)}] {sid}: ERROR {type(exc).__name__}: {exc}")
+    summary = {"embedded": embedded, "errors": errors, "dry_run": dry_run}
+    print(f"[reindex] done: {summary}")
+    return summary
+
+
 def backfill(*, limit: int | None = None, dry_run: bool = False) -> dict:
     if _openai_client() is None:
         print("[backfill] OPENAI_API_KEY not set — only SQL columns can be defaulted, no LLM re-extraction.")
@@ -131,8 +187,12 @@ def main() -> None:
     ap = argparse.ArgumentParser(description="Backfill Q&A topics/outcome + Milvus memories for ended sessions.")
     ap.add_argument("--limit", type=int, default=None, help="max sessions to process (default: all)")
     ap.add_argument("--dry-run", action="store_true", help="report what would happen, write nothing")
+    ap.add_argument("--reindex", action="store_true", help="re-embed ALL ended sessions into Milvus from stored data (sync outcomes)")
     args = ap.parse_args()
-    backfill(limit=args.limit, dry_run=args.dry_run)
+    if args.reindex:
+        reindex_memories(limit=args.limit, dry_run=args.dry_run)
+    else:
+        backfill(limit=args.limit, dry_run=args.dry_run)
 
 
 if __name__ == "__main__":
