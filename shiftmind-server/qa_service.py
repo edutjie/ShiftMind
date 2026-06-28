@@ -74,7 +74,16 @@ _SCHEMA_HINT = (
     "\n"
     "outcome is TEXT with canonical values 'converted','not_converted','unknown'. Compute\n"
     "conversion rate as SUM(outcome='converted') / COUNT(*). duration_seconds is the\n"
-    "conversation length in seconds. employee_id/location_id are nullable."
+    "conversation length in seconds. employee_id/location_id are nullable.\n"
+    "\n"
+    "ALWAYS join to return human-readable names, never bare ids:\n"
+    "  SELECT e.name AS employee, AVG(s.duration_seconds) AS avg_dur\n"
+    "  FROM customer_sessions s JOIN employees e ON e.id = s.employee_id\n"
+    "  WHERE s.status='ended' GROUP BY e.name ORDER BY avg_dur DESC;\n"
+    "  SELECT c.name AS customer, s.duration_seconds FROM customer_sessions s\n"
+    "  JOIN customers c ON c.id = s.customer_id ORDER BY s.duration_seconds DESC LIMIT 5;\n"
+    "When you GROUP BY employee/customer, group by the name (or id) AND select the name\n"
+    "so the answer can name them. Mention the id in parentheses only if useful."
 )
 
 TOOLS = [
