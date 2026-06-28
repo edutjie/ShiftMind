@@ -146,3 +146,28 @@ def test_shorten_answer_falls_back_when_no_client(monkeypatch):
     out = _shorten_answer("q", "A long answer with **markdown** that must shrink to fit the HUD budget.")
     assert len(out) <= 140
     assert "*" not in out
+
+
+def test_history_is_prepended_to_messages(monkeypatch):
+    captured = []
+
+    class _Completions:
+        def create(self, **kwargs):
+            captured.append([{"role": m["role"], "content": m.get("content")} for m in kwargs["messages"]])
+            from types import SimpleNamespace
+            return SimpleNamespace(choices=[SimpleNamespace(message=SimpleNamespace(content="done"))])
+
+    fake = SimpleNamespace(chat=SimpleNamespace(completions=_Completions()))
+    monkeypatch.setattr("session_service._openai_client", lambda: fake)
+    monkeypatch.setattr(qa_service, "_shorten_answer", lambda q, a: "s")
+    monkeypatch.setattr(qa_service, "_sources_for", lambda ids: [])
+
+    answer_question(
+        "follow up",
+        history=[{"role": "user", "content": "who is best?"},
+                 {"role": "assistant", "content": "Sofia Kim"}],
+    )
+    roles = [m["role"] for m in captured[0]]
+    assert roles == ["system", "user", "assistant", "user"]
+    assert captured[0][-1]["content"] == "follow up"
+    assert captured[0][1]["content"] == "who is best?"

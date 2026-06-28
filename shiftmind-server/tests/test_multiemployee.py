@@ -6,27 +6,29 @@ upserts so re-runs don't accumulate rows in the dev DB.
 """
 from __future__ import annotations
 
-import sqlite3
-
 import pytest
 
 from auth import active_login, hash_pin, verify_pin
 from face_recognition_service import RecognitionResult
 from session_service import session_service
-from storage import DATA_DIR, storage
+from storage import Storage, storage
 
-_DB = str(DATA_DIR / "shiftmind.sqlite3")
-
-
-def _conn() -> sqlite3.Connection:
-    conn = sqlite3.connect(_DB)
-    conn.row_factory = sqlite3.Row
-    conn.execute("PRAGMA foreign_keys = ON")
-    return conn
+@pytest.fixture(autouse=True)
+def _isolated_db(tmp_path, monkeypatch):
+    """Run every test in this file against a fresh tmp DB so it never pollutes
+    the dev `data/shiftmind.sqlite3` (which the Q&A dropdowns read from)."""
+    db = tmp_path / "multiemp.sqlite3"
+    Storage(db)  # runs the idempotent migrations on the tmp DB
+    monkeypatch.setattr(storage, "path", db)
+    active_login.clear()
+    session_service.reset()
+    yield
+    active_login.clear()
+    session_service.reset()
 
 
 def _upsert_location(lid: str, name: str) -> None:
-    with _conn() as c:
+    with storage.connect() as c:
         c.execute(
             "INSERT INTO locations (id, name, created_at) VALUES (?, ?, '2026-01-01T00:00:00Z') "
             "ON CONFLICT(id) DO UPDATE SET name=excluded.name",
@@ -35,7 +37,7 @@ def _upsert_location(lid: str, name: str) -> None:
 
 
 def _upsert_employee(eid: str, name: str, home: str | None = None, pin_hash: str | None = None) -> None:
-    with _conn() as c:
+    with storage.connect() as c:
         c.execute(
             "INSERT INTO employees (id, name, pin_hash, home_location_id, created_at) "
             "VALUES (?, ?, ?, ?, '2026-01-01T00:00:00Z') "
@@ -46,7 +48,7 @@ def _upsert_employee(eid: str, name: str, home: str | None = None, pin_hash: str
 
 
 def _upsert_customer(cid: str, name: str) -> None:
-    with _conn() as c:
+    with storage.connect() as c:
         c.execute(
             "INSERT INTO customers (id, name, memory_card, preferences_json, created_at, updated_at) "
             "VALUES (?, ?, '', '[]', '2026-01-01T00:00:00Z', '2026-01-01T00:00:00Z') "
@@ -57,7 +59,7 @@ def _upsert_customer(cid: str, name: str) -> None:
 
 def _insert_ended_session(sid: str, customer_id: str, employee_id: str, location_id: str | None,
                           ended_at: str, summary: str = "s") -> None:
-    with _conn() as c:
+    with storage.connect() as c:
         c.execute(
             "INSERT INTO customer_sessions "
             "(id, customer_id, status, is_new_customer, summary, started_at, ended_at, employee_id, location_id) "
@@ -67,7 +69,7 @@ def _insert_ended_session(sid: str, customer_id: str, employee_id: str, location
 
 
 def _delete_test_sessions(prefix: str) -> None:
-    with _conn() as c:
+    with storage.connect() as c:
         c.execute("DELETE FROM customer_sessions WHERE id LIKE ?", (f"{prefix}%",))
 
 
@@ -144,7 +146,7 @@ def test_session_stamped_with_active_employee_and_location(clean_active_login):
     cid = "person-test-stamp"
     storage.upsert_customer(customer_id=cid, name="Stamp Person", memory_card="")
     # Abort any lingering active session for this customer from prior runs.
-    with _conn() as c:
+    with storage.connect() as c:
         c.execute(f"UPDATE customer_sessions SET status='aborted' WHERE customer_id='{cid}' AND status='active'")
 
     active_login.set(employee_id="test-emp-a", employee_name="Maya",
@@ -157,14 +159,14 @@ def test_session_stamped_with_active_employee_and_location(clean_active_login):
     assert row["employee_id"] == "test-emp-a"
     assert row["location_id"] == "test-loc-a"
     # Tidy up so the active session doesn't leak into other runs.
-    with _conn() as c:
+    with storage.connect() as c:
         c.execute(f"UPDATE customer_sessions SET status='aborted' WHERE id='{res.session_id}'")
 
 
 def test_session_has_null_employee_when_no_login(clean_active_login):
     cid = "person-test-nologin"
     storage.upsert_customer(customer_id=cid, name="NoLogin Person", memory_card="")
-    with _conn() as c:
+    with storage.connect() as c:
         c.execute(f"UPDATE customer_sessions SET status='aborted' WHERE customer_id='{cid}' AND status='active'")
 
     # No active login → session still opens, just unattributed.
@@ -175,5 +177,5 @@ def test_session_has_null_employee_when_no_login(clean_active_login):
     row = storage.latest_active_session()
     assert row["employee_id"] is None
     assert row["location_id"] is None
-    with _conn() as c:
+    with storage.connect() as c:
         c.execute(f"UPDATE customer_sessions SET status='aborted' WHERE id='{res.session_id}'")

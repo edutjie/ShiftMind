@@ -136,30 +136,47 @@ transcripts.
 ## Q&A agent
 
 `/api/qa.html` exposes a tool-calling agent over the collected interaction
-history. An OpenAI-compatible chat loop picks between two tools per question:
+history. An OpenAI-compatible chat loop picks between six tools per question:
 
-- `run_sql` — read-only SELECT against SQLite (counts, rates, rankings,
-  filters by employee/location/outcome/date). Driver-level `mode=ro` plus a
-  statement guard and a 50-row cap; writes/DDL/multi-statement are rejected.
+- `run_sql` — read-only SELECT against SQLite (counts, rates, rankings, time
+  trends, filters by employee/location/outcome/date). Driver-level `mode=ro`
+  plus a statement guard and a 50-row cap; writes/DDL/multi-statement rejected.
 - `vector_search` — semantic search over the `session_memories` Milvus
   collection (topical/free-form recall), filterable by employee/location/date.
+- `search_customers` → `customer_profile` — resolve a customer by name/topic,
+  then pull their full profile (sessions, topics, outcomes, memory_card,
+  preferences, first/last seen). For "tell me about the customer who…".
+- `compare` — side-by-side stats for two employees or two locations.
+- `find_outliers` — anomalies: longest sessions, employees far from mean
+  conversion, topics with abnormally long discussions.
 
 The page renders the agent's markdown answer (lists, bold, code), shows a
 tool-call trace + source sessions, and exposes:
 
 - **Filters** (location, employee, topic, date range, simulated/real toggle) —
   passed to the agent as a MANDATORY SCOPE block for `run_sql` and applied
-  programmatically to `vector_search`. `GET /api/qa/filters` populates the
-  dropdowns from the live DB.
-- **Suggested questions** — generated from real DB stats (top topics, busiest
-  employee/location, worst-conversion store). "🎲 surprise me" asks the LLM for
-  creative suggestions tied to the dataset. `GET /api/qa/suggestions?creative=1`.
-- **Overview dashboard** — `GET /api/qa/snapshot?narrative=1` returns totals,
-  conversion rate, avg duration, top topics/employees/locations, and an LLM
-  narrative; rendered as stat cards.
+  programmatically to `vector_search`. Filters also scope the overview +
+  suggestions. `GET /api/qa/filters` populates the dropdowns.
+- **Suggested questions** — generated from real (scoped) DB stats; "🎲 surprise
+  me" asks the LLM for creative dataset-specific questions.
+  `GET /api/qa/suggestions?creative=1`.
+- **Overview dashboard** — `GET /api/qa/snapshot?narrative=1` returns scoped
+  totals, conversion rate, avg duration, top topics/employees/locations, and an
+  LLM narrative; rendered as stat cards.
+- **Conversation memory** — prior turns are sent with each ask so follow-ups
+  ("and for last week?") resolve against context. "↺ clear chat" resets.
 - **`short_answer`** — every `/api/qa/ask` response includes a ≤140-char
   plain-text distillation for the eventual AR-glasses HUD (matches the
   `liveTranscript` budget). Glasses-side rendering is a future change.
+
+Simulated dataset for paper testing (`scripts/seed_simulated.py`, prefix-isolated
+`sim-*` cohort, non-destructive):
+
+```bash
+uv run python -m scripts.seed_simulated --months 6 --sessions 200   # spans ~6 months
+uv run python -m scripts.normalize_sim_data                          # canonicalize outcomes
+uv run python -m scripts.clean_test_artifacts                        # remove dev/test-fixture rows
+```
 
 Backfill older sessions (summarized before topics/outcome existed) with:
 

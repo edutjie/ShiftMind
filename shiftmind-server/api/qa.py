@@ -27,9 +27,27 @@ class QaFilters(BaseModel):
     simulated: str = "all"            # all | real | sim
 
 
+class Turn(BaseModel):
+    role: str
+    content: str
+
+
 class AskPayload(BaseModel):
     question: str
     filters: QaFilters | None = None
+    history: list[Turn] | None = None
+
+
+def _filters_from_query(
+    location_id: str | None, employee_id: str | None, topic: str | None,
+    date_from: str | None, date_to: str | None, simulated: str,
+) -> dict | None:
+    f = {
+        "location_id": location_id, "employee_id": employee_id, "topic": topic,
+        "date_from": date_from, "date_to": date_to, "simulated": simulated or "all",
+    }
+    f = {k: v for k, v in f.items() if v not in (None, "", "all")}
+    return f or None
 
 
 @router.get("/api/qa/filters")
@@ -45,22 +63,42 @@ async def ask(payload: AskPayload) -> dict:
     # qa_service.answer_question is blocking (sync HTTP + SQLite + Milvus).
     login = active_login.read()
     filters = payload.filters.model_dump() if payload.filters else None
+    history = [t.model_dump() for t in payload.history] if payload.history else None
     return await asyncio.to_thread(
         qa_service.answer_question,
         question,
         employee_id=login.employee_id if login else None,
         filters=filters,
+        history=history,
     )
 
 
 @router.get("/api/qa/suggestions")
-async def suggestions(creative: bool = False) -> dict:
-    return await asyncio.to_thread(qa_service.get_suggestions, creative=creative)
+async def suggestions(
+    creative: bool = False,
+    location_id: str | None = None,
+    employee_id: str | None = None,
+    topic: str | None = None,
+    date_from: str | None = None,
+    date_to: str | None = None,
+    simulated: str = "all",
+) -> dict:
+    filters = _filters_from_query(location_id, employee_id, topic, date_from, date_to, simulated)
+    return await asyncio.to_thread(qa_service.get_suggestions, creative=creative, filters=filters)
 
 
 @router.get("/api/qa/snapshot")
-async def snapshot(narrative: bool = False) -> dict:
-    return await asyncio.to_thread(qa_service.get_snapshot, narrative=narrative)
+async def snapshot(
+    narrative: bool = False,
+    location_id: str | None = None,
+    employee_id: str | None = None,
+    topic: str | None = None,
+    date_from: str | None = None,
+    date_to: str | None = None,
+    simulated: str = "all",
+) -> dict:
+    filters = _filters_from_query(location_id, employee_id, topic, date_from, date_to, simulated)
+    return await asyncio.to_thread(qa_service.get_snapshot, narrative=narrative, filters=filters)
 
 
 @router.get("/api/qa.html")
@@ -154,6 +192,7 @@ semantic memory, then answers with sources.</p>
   <button id="ask">Ask</button>
   <button id="surprise" type="button" class="ghost">🎲 surprise me</button>
   <button id="overview" type="button" class="ghost">📊 overview</button>
+  <button id="clearchat" type="button" class="ghost">↺ clear chat</button>
   <span id="status" class="muted"></span>
 </div>
 <div class="chips" id="chips"></div>
@@ -172,10 +211,19 @@ function renderChips(list){
     chips.appendChild(b);
   });
 }
+function filtersToQuery(extra){
+  const f = buildFilters();
+  const p = new URLSearchParams();
+  if(extra) for(const k in extra) p.set(k, extra[k]);
+  for(const k of ["location_id","employee_id","topic","date_from","date_to","simulated"]){
+    if(f[k] && f[k] !== "all") p.set(k, f[k]);
+  }
+  const s = p.toString();
+  return s ? "?"+s : "";
+}
 async function loadChips(creative){
-  const qs = creative ? "?creative=1" : "";
   try{
-    const r = await fetch("/api/qa/suggestions"+qs);
+    const r = await fetch("/api/qa/suggestions"+filtersToQuery({creative: creative?1:0}));
     const d = await r.json();
     renderChips(d.suggestions);
   }catch(e){ /* keep last render */ }
@@ -282,6 +330,7 @@ function fmtArgs(t){
   return esc(t.args);
 }
 
+let chatHistory = [];
 async function run(){
   const q = document.getElementById("q").value.trim();
   if(!q) return;
@@ -294,7 +343,7 @@ async function run(){
   try{
     const r = await fetch("/api/qa/ask", {
       method:"POST", headers:{"Content-Type":"application/json"},
-      body: JSON.stringify({question: q, filters: buildFilters()})
+      body: JSON.stringify({question: q, filters: buildFilters(), history: chatHistory})
     });
     const d = await r.json();
     if(!d.configured){
@@ -322,6 +371,8 @@ async function run(){
     }
     html += "</div>";
     out.innerHTML = html;
+    chatHistory.push({role:"user", content:q}, {role:"assistant", content:d.answer});
+    if(chatHistory.length > 12) chatHistory = chatHistory.slice(-12);
   }catch(e){
     out.innerHTML = "<div class='panel err'>request failed: "+esc(e.message||e)+"</div>";
   }finally{
@@ -332,13 +383,17 @@ async function run(){
 document.getElementById("ask").onclick = run;
 document.getElementById("surprise").onclick = () => loadChips(true);
 document.getElementById("overview").onclick = overview;
+document.getElementById("clearchat").onclick = () => {
+  chatHistory = [];
+  document.getElementById("result").innerHTML = "";
+};
 document.getElementById("q").addEventListener("keydown", e => { if((e.metaKey||e.ctrlKey)&&e.key==="Enter") run(); });
 
 async function overview(){
   const out = document.getElementById("result");
   out.innerHTML = "<div class='panel muted'>loading overview…</div>";
   try{
-    const r = await fetch("/api/qa/snapshot?narrative=1");
+    const r = await fetch("/api/qa/snapshot"+filtersToQuery({narrative:1}));
     const d = await r.json();
     out.innerHTML = renderSnapshot(d);
   }catch(e){ out.innerHTML = "<div class='panel err'>overview failed: "+esc(e.message||e)+"</div>"; }

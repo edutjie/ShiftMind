@@ -97,11 +97,10 @@ def _norm_vec(rng: np.random.Generator, dim: int) -> list[float]:
     return (v / n).tolist()
 
 
-def _ts_pair(rng: np.random.Generator) -> tuple[str, str, float]:
-    """A random (started, ended, duration_seconds) within the last ~60 days."""
+def _ts_pair(rng: np.random.Generator, months: int = 6) -> tuple[str, str, float]:
+    """A random (started, ended, duration_seconds) within the last ~`months` months."""
     now = time.time()
-    started = now - rng.integers(0, 60 * 24 * 3600)
-    outcome = None  # duration set by caller via DURATION_MIN
+    started = now - rng.integers(0, months * 30 * 24 * 3600)
     return int(started), None, 0.0
 
 
@@ -238,11 +237,16 @@ def build_customers(client, n: int, rng: np.random.Generator) -> list[dict]:
     return out
 
 
-def _sample_profiles(rng, n_sessions, customers, employees, locations):
-    """Sample n_sessions session profiles; customer visits follow a long tail."""
+def _sample_profiles(rng, n_sessions, customers, employees, locations, months=6):
+    """Sample n_sessions session profiles; customer visits follow a long tail.
+
+    `started` is spread uniformly over the last `months` months so trend
+    questions (monthly conversion, busiest month) have something to chew on.
+    """
     # weight customers so some are regulars, many are one-timers
     cust_ids = [c["id"] for c in customers]
     cust_weights = rng.dirichlet(np.ones(len(cust_ids)) * 0.6).tolist()
+    span_seconds = int(months * 30 * 24 * 3600)
     profiles = []
     for _ in range(n_sessions):
         cust_id = str(rng.choice(cust_ids, p=cust_weights))
@@ -252,7 +256,7 @@ def _sample_profiles(rng, n_sessions, customers, employees, locations):
             "location": rng.choice(locations),
             "outcome": _pick_weighted(rng, OUTCOMES),
             "product": str(rng.choice(PRODUCTS)),
-            "started": int(time.time()) - int(rng.integers(0, 60 * 24 * 3600)),
+            "started": int(time.time()) - int(rng.integers(0, span_seconds)),
         })
     return profiles
 
@@ -414,10 +418,11 @@ def print_summary(results, customers, employees, locations):
 
 def main() -> int:
     ap = argparse.ArgumentParser(description="Seed simulated ShiftMind interactions.")
-    ap.add_argument("--sessions", type=int, default=150)
+    ap.add_argument("--sessions", type=int, default=200)
     ap.add_argument("--customers", type=int, default=50)
     ap.add_argument("--employees", type=int, default=8)
     ap.add_argument("--locations", type=int, default=3)
+    ap.add_argument("--months", type=int, default=6, help="span sessions over the last N months (trend data)")
     ap.add_argument("--batch", type=int, default=5, help="transcripts per LLM call")
     ap.add_argument("--seed", type=int, default=42)
     ap.add_argument("--reset", dest="reset", action="store_true", default=True,
@@ -434,7 +439,7 @@ def main() -> int:
         fake_emps = [{"id": f"{SIM}-emp-{i+1:03d}", "name": f"Employee{i+1}", "home_location_id": ""} for i in range(args.employees)]
         fake_locs = [{"id": f"{SIM}-loc-{i+1:03d}", "name": f"Store{i+1}"} for i in range(args.locations)]
         fake_custs = [{"id": f"{SIM}-cust-{i+1:03d}", "name": f"Customer{i+1}", "memory_card": ""} for i in range(args.customers)]
-        profiles = _sample_profiles(rng, args.sessions, fake_custs, fake_emps, fake_locs)
+        profiles = _sample_profiles(rng, args.sessions, fake_custs, fake_emps, fake_locs, months=args.months)
         results = [{
             "outcome": p["outcome"], "product": p["product"],
             "employee": p["employee"]["name"], "location": p["location"]["name"],
@@ -462,7 +467,7 @@ def main() -> int:
     customers_by_id = {c["id"]: c for c in customers}
 
     print(f"[seed] generating {args.sessions} sessions (batch={args.batch}) …")
-    profiles = _sample_profiles(rng, args.sessions, customers, employees, locations)
+    profiles = _sample_profiles(rng, args.sessions, customers, employees, locations, months=args.months)
     results = build_sessions(client, profiles, customers_by_id, rng, batch=args.batch)
 
     print_summary(results, customers, employees, locations)
