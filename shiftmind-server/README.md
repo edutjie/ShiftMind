@@ -58,6 +58,17 @@ SHIFTMIND_TRANSCRIBE_MODEL=whisper-large-v3-turbo
 SHIFTMIND_LLM_MODEL="gpt-5.4-mini"
 ```
 
+The Q&A agent reuses the same OpenAI-compatible client for chat + text
+embeddings. Embeddings land in a second Milvus Lite collection
+(`session_memories`); the dim is fixed at collection creation, so set these
+before the first run (and don't change them afterward without dropping the
+collection):
+
+```bash
+SHIFTMIND_EMBED_MODEL=text-embedding-3-small   # any OpenAI-compatible embeddings model
+SHIFTMIND_EMBED_DIM=1536                        # must match the model's output dim
+```
+
 ## Endpoints
 
 | Endpoint | Method | Purpose |
@@ -75,6 +86,8 @@ SHIFTMIND_LLM_MODEL="gpt-5.4-mini"
 | `/api/preview-face` | GET | Live MJPEG stream of the latest face crop. |
 | `/api/preview.html` | GET | Convenience page showing HUD preview + latest face crop. |
 | `/api/preview-status` | GET | Preview, face crop, and recognition status JSON. |
+| `/api/qa.html` | GET | Q&A agent page. Employee types a business-insight question; the agent calls `run_sql` / `vector_search` tools and renders the answer + tool trace + sources. |
+| `/api/qa/ask` | POST | JSON `{question}`. Runs the tool-calling loop, returns `{answer, trace, sources, iterations, elapsed_ms}`. |
 
 ## Face recognition dev flow
 
@@ -90,8 +103,8 @@ SHIFTMIND_LLM_MODEL="gpt-5.4-mini"
 
 Data lives under `shiftmind-server/data/` and is gitignored:
 
-- `shiftmind.sqlite3` — customers, face images, recognition events.
-- `milvus/shiftmind.db` — Milvus Lite vector store.
+- `shiftmind.sqlite3` — customers, face images, recognition events, customer sessions.
+- `milvus/shiftmind.db` — Milvus Lite vector store (`face_embeddings` + `session_memories` collections).
 - `faces/*.jpg` — saved enrollment crops.
 - `audio/*.wav` — uploaded customer-session voice recordings.
 
@@ -103,13 +116,37 @@ ShiftMind keeps per-interaction notes separate from the long-lived memory card:
 | :--- | :--- | :--- |
 | `customer_sessions.summary` | One session | Immutable summary of the completed interaction. |
 | `customer_sessions.important_points_json` | One session | Extracted facts from that interaction. |
+| `customer_sessions.topics_json` | One session | 1–5 lowercase topic tags (e.g. `["returns","warranty"]`), used for "popular topic" queries. |
+| `customer_sessions.outcome` | One session | `converted` / `not_converted` / `unknown` — drives conversion-rate questions. |
+| `customer_sessions.duration_seconds` | One session | Conversation length, derived at finish — drives "longest conversation" queries. |
 | `customers.memory_card` | Customer lifetime | Concise cumulative memory shown on the glasses HUD. |
 
 At session finish, the server uses the configured OpenAI-compatible chat
-completion API to summarize the transcript as JSON, then re-summarizes the
-cumulative `customers.memory_card` so it stays short enough for AR display.
-If LLM credentials are missing or unavailable, the fallback keeps a bounded
-summary rather than appending unbounded raw transcripts.
+completion API to summarize the transcript as JSON (summary, important
+points, name, topics, outcome), then re-summarizes the cumulative
+`customers.memory_card` so it stays short enough for AR display, and upserts
+a `session_memories` vector (summary + points) into Milvus Lite for semantic
+recall by the Q&A agent. If LLM credentials are missing or unavailable, the
+fallback keeps a bounded summary rather than appending unbounded raw
+transcripts.
+
+## Q&A agent
+
+`/api/qa.html` exposes a tool-calling agent over the collected interaction
+history. An OpenAI-compatible chat loop picks between two tools per question:
+
+- `run_sql` — read-only SELECT against SQLite (counts, rates, rankings,
+  filters by employee/location/outcome/date). Driver-level `mode=ro` plus a
+  statement guard and a 50-row cap; writes/DDL/multi-statement are rejected.
+- `vector_search` — semantic search over the `session_memories` Milvus
+  collection (topical/free-form recall).
+
+Backfill older sessions (summarized before topics/outcome existed) with:
+
+```bash
+uv run python -m scripts.backfill_qa --dry-run
+uv run python -m scripts.backfill_qa --limit 10
+```
 
 The glasses HUD treats stored memory and current speech as separate surfaces:
 `CustomerCard.memoryLine` is previous-session memory, while
