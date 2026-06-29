@@ -111,13 +111,20 @@ class FaceRecognitionService:
         return emb / norm, quality
 
     def enroll_latest_crop(self, *, customer_id: str, name: str, memory_card: str, crop_jpeg: bytes) -> dict[str, Any]:
-        embedding, quality = self.embed_jpeg(crop_jpeg)
         customer = storage.upsert_customer(
             customer_id=customer_id,
             name=name,
             memory_card=memory_card,
             preferences=[],
         )
+        return self.add_face_observation(customer_id=customer.id, crop_jpeg=crop_jpeg)
+
+    def add_face_observation(self, *, customer_id: str, crop_jpeg: bytes) -> dict[str, Any]:
+        """Store another real-session face sample for an existing customer."""
+        customer = storage.get_customer(customer_id)
+        if not customer:
+            raise KeyError(customer_id)
+        embedding, quality = self.embed_jpeg(crop_jpeg)
         face_image_id, image_path = storage.add_face_image(
             customer_id=customer.id,
             image_bytes=crop_jpeg,
@@ -160,7 +167,12 @@ class FaceRecognitionService:
             return result
 
         top1 = hits[0]
-        top2_score = hits[1]["score"] if len(hits) > 1 else 0.0
+        # Multiple session observations may occupy the nearest slots. Margin
+        # must compare identities, not two embeddings belonging to one person.
+        top2_score = next(
+            (hit["score"] for hit in hits[1:] if hit["customer_id"] != top1["customer_id"]),
+            0.0,
+        )
         similarity = float(top1["score"])
         margin = float(similarity - top2_score)
         customer_id = str(top1["customer_id"])

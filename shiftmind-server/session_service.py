@@ -2,7 +2,9 @@
 from __future__ import annotations
 
 import json
+import logging
 import os
+import re
 import threading
 import time
 from dataclasses import dataclass
@@ -11,6 +13,8 @@ from typing import Any
 from auth import active_login
 from face_recognition_service import MODEL_NAME, RecognitionResult, get_face_service
 from storage import storage
+
+LOG = logging.getLogger(__name__)
 
 
 @dataclass(frozen=True)
@@ -64,6 +68,16 @@ class SessionService:
                 customer = storage.get_customer(result.person_id)
                 if not customer:
                     return None
+                if crop_jpeg:
+                    try:
+                        get_face_service().add_face_observation(
+                            customer_id=customer.id,
+                            crop_jpeg=crop_jpeg,
+                        )
+                    except Exception:
+                        # Recognition already succeeded. A failed enrichment write
+                        # must not prevent the customer session from starting.
+                        LOG.exception("failed to save recognized face observation for %s", customer.id)
                 session = storage.create_customer_session(
                     customer_id=customer.id,
                     is_new_customer=False,
@@ -131,7 +145,7 @@ class SessionService:
 
         summary = str(summary_data.get("summary") or "").strip() or "Session ended. No transcript summary available yet."
         points = [str(p).strip() for p in summary_data.get("important_points", []) if str(p).strip()]
-        extracted_name = str(summary_data.get("name") or "").strip()
+        extracted_name = str(summary_data.get("name") or "").strip() or _extract_explicit_name(transcript)
         topics = [str(t).strip() for t in summary_data.get("topics", []) if str(t).strip()]
         outcome = str(summary_data.get("outcome") or "unknown").strip() or "unknown"
 
@@ -168,9 +182,11 @@ class SessionService:
 
         customer = storage.get_customer(str(row["customer_id"]))
         if customer:
-            new_name = customer.name
-            if bool(row.get("is_new_customer")) and extracted_name:
-                new_name = extracted_name
+            new_name = _name_after_interaction(
+                customer_id=customer.id,
+                stored_name=customer.name,
+                extracted_name=extracted_name,
+            )
 
             # Get historical session data for better context
             session_history = storage.get_customer_session_history(customer.id, limit=5)
@@ -178,6 +194,7 @@ class SessionService:
             # Compose cumulative memory card using LLM with full historical context
             memory_card = _update_memory_card_with_llm(
                 customer_id=customer.id,
+                customer_name=new_name,
                 existing_memory=customer.memory_card,
                 new_summary=summary,
                 new_points=points,
@@ -234,6 +251,33 @@ class SessionService:
     def reset(self) -> None:
         with self._lock:
             self._active = None
+
+
+def _name_after_interaction(*, customer_id: str, stored_name: str, extracted_name: str) -> str:
+    """Fill a missing customer name from any interaction; never overwrite a known name."""
+    current = stored_name.strip()
+    learned = extracted_name.strip()
+    missing = not current or current.casefold() == "unknown customer" or current.casefold() == customer_id.casefold()
+    return learned if missing and learned else stored_name
+
+
+def _extract_explicit_name(transcript: str) -> str:
+    """Fallback when the LLM mentions a name in prose but omits its JSON field."""
+    for pattern in (
+        r"\bmy name is\s+([A-Za-z][A-Za-z' -]{0,48})",
+        r"\bcall me\s+([A-Za-z][A-Za-z' -]{0,48})",
+    ):
+        match = re.search(pattern, transcript, flags=re.IGNORECASE)
+        if match:
+            return re.split(r"[,.!?;]|\s+(?:and|but)\b", match.group(1), maxsplit=1, flags=re.IGNORECASE)[0].strip().title()
+    return ""
+
+
+def _without_customer_name(text: str, customer_name: str) -> str:
+    name = customer_name.strip()
+    if not text or not name or name.casefold() == "unknown customer":
+        return text
+    return re.sub(rf"\b{re.escape(name)}\b", "the customer", text, flags=re.IGNORECASE)
 
 
 def _active_from_row(row: dict[str, Any]) -> ActiveSession:
@@ -384,6 +428,7 @@ def _update_memory_card_with_llm(
     new_summary: str,
     new_points: list[str],
     session_history: list[dict[str, Any]] | None = None,
+    customer_name: str = "",
 ) -> str:
     """
     Use LLM to maintain a concise, cumulative memory card for AR glasses display.
@@ -398,6 +443,14 @@ def _update_memory_card_with_llm(
         new_points: Important points extracted from the just-completed session
         session_history: List of recent session data (summaries + important_points)
     """
+    existing_memory = _without_customer_name(existing_memory, customer_name)
+    new_summary = _without_customer_name(new_summary, customer_name)
+    new_points = [
+        _without_customer_name(point, customer_name)
+        for point in new_points
+        if not point.strip().casefold().startswith("name:")
+    ]
+
     # Skip if new session has no meaningful content
     if not new_summary or new_summary.startswith("Session ended."):
         return existing_memory
@@ -446,6 +499,7 @@ def _update_memory_card_with_llm(
         "CRITICAL CONSTRAINTS:\n"
         "- Maximum 2-3 short sentences (under 150 characters total)\n"
         "- Focus on ACTIONABLE facts: preferences, needs, personal details\n"
+        "- Never include the customer's name; identity is displayed separately\n"
         "- Merge redundant information across sessions\n"
         "- Keep most recent/important facts, drop outdated ones\n"
         "- Use bullet points for multiple facts\n\n"
@@ -479,7 +533,7 @@ def _update_memory_card_with_llm(
         if len(updated_memory) > 200:
             updated_memory = updated_memory[:197] + "..."
 
-        return updated_memory if updated_memory else existing_memory
+        return _without_customer_name(updated_memory, customer_name) if updated_memory else existing_memory
 
     except Exception as exc:
         # Fallback: use simple composition
