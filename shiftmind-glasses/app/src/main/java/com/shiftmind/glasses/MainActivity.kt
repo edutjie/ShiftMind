@@ -23,6 +23,7 @@ import com.shiftmind.glasses.net.HudStateClient
 import com.shiftmind.glasses.net.SessionAudioStreamClient
 import com.shiftmind.glasses.net.SessionClient
 import com.shiftmind.glasses.recording.ArRecorder
+import com.shiftmind.glasses.recording.MicConfigProbe
 import com.shiftmind.glasses.recording.RecordingStateReceiver
 import com.shiftmind.glasses.recording.RokidHudRecorder
 import com.shiftmind.glasses.recording.VoiceSessionRecorder
@@ -30,6 +31,7 @@ import com.shiftmind.glasses.service.GlassesService
 import com.shiftmind.glasses.session.CustomerSessionHolder
 import com.shiftmind.glasses.session.CustomerSessionState
 import com.shiftmind.glasses.ui.theme.GlassHudTheme
+import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.delay
@@ -65,12 +67,21 @@ class MainActivity : ComponentActivity() {
     private var screenWakeLock: PowerManager.WakeLock? = null
     private var transcriptClearJob: Job? = null
 
+    // Completes once the startup mic-config probe has finished (or is skipped).
+    // Camera/preview start awaits this so Camera2 never opens while we're
+    // probing alternate mic sources/channel masks — per CLAUDE.md, probing
+    // before camera avoids wedging the HAL. No-op when AUDIO_PROBE is false.
+    private val probeDone: CompletableDeferred<Unit> = CompletableDeferred()
+
     private val cameraPermissionRequest = registerForActivityResult(
         ActivityResultContracts.RequestPermission(),
     ) { granted ->
         if (granted) {
             Log.i(TAG, "Camera permission granted; starting preview stream")
-            startStreamerIfForeground()
+            lifecycleScope.launch {
+                probeDone.await()
+                startStreamerIfForeground()
+            }
         } else {
             Log.w(TAG, "Camera permission denied; preview stream disabled")
         }
@@ -114,6 +125,7 @@ class MainActivity : ComponentActivity() {
         hudRecorder.observeStateBroadcasts()
         startHudStateMirror()
         startCustomerSessionWatcher()
+        maybeRunMicProbe()
         ensureCameraPermission()
         ensureAudioPermission()
 
@@ -126,7 +138,43 @@ class MainActivity : ComponentActivity() {
 
     override fun onResume() {
         super.onResume()
-        window.decorView.postDelayed({ startStreamerIfForeground() }, 300)
+        // Wait for the startup mic probe (if running) before opening Camera2.
+        // When AUDIO_PROBE is off, probeDone is already complete → no delay.
+        lifecycleScope.launch {
+            probeDone.await()
+            startStreamerIfForeground()
+        }
+    }
+
+    /**
+     * TEMP: run MicConfigProbe at startup, behind BuildConfig.AUDIO_PROBE and
+     * only if RECORD_AUDIO is already granted. Probe runs before the camera
+     * opens (see onResume / cameraPermissionRequest gating on probeDone).
+     * Always completes probeDone so camera startup never hangs.
+     */
+    private fun maybeRunMicProbe() {
+        if (!BuildConfig.AUDIO_PROBE) {
+            probeDone.complete(Unit)
+            return
+        }
+        val micGranted = ContextCompat.checkSelfPermission(
+            this, Manifest.permission.RECORD_AUDIO
+        ) == PackageManager.PERMISSION_GRANTED
+        if (!micGranted) {
+            Log.w(TAG, "AUDIO_PROBE on but RECORD_AUDIO not granted yet — skipping probe this run")
+            probeDone.complete(Unit)
+            return
+        }
+        lifecycleScope.launch(Dispatchers.IO) {
+            Log.i(TAG, "AUDIO_PROBE: launching MicConfigProbe (camera gated until done)")
+            try {
+                MicConfigProbe(applicationContext).run()
+            } catch (t: Throwable) {
+                Log.e(TAG, "MicConfigProbe crashed: ${t.javaClass.simpleName}: ${t.message}", t)
+            } finally {
+                probeDone.complete(Unit)
+            }
+        }
     }
 
     override fun onPause() {

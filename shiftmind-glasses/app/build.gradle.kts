@@ -51,11 +51,18 @@ android {
         // Default -90 matches server preview: raw 640x480 sensor -> upright
         // 480x640 recording. If future hardware differs, try 0 / 90 / 180.
         val recordingRotation = localProp("shiftmind.recordingRotation", "-90")
+        // Temp diagnostic: when true, MicConfigProbe runs at app start (before
+        // the camera opens) and logs per-config/per-channel dBFS so we can pick
+        // a mic config that captures far-field customer speech. Set
+        // shiftmind.audioProbe=true in local.properties for the diagnostic
+        // build; default off. Remove once the runtime config is locked.
+        val audioProbe = localProp("shiftmind.audioProbe", "false")
         buildConfigField("String", "SERVER_URL", "\"$serverUrl\"")
         buildConfigField("int", "PREVIEW_FPS", previewFps)
         buildConfigField("int", "RECORDING_KEY", recordingKey)
         buildConfigField("int", "SESSION_KEY", sessionKey)
         buildConfigField("int", "RECORDING_ROTATION_DEG", recordingRotation)
+        buildConfigField("boolean", "AUDIO_PROBE", audioProbe)
     }
 
     buildTypes {

@@ -3,7 +3,9 @@ package com.shiftmind.glasses.recording
 import android.Manifest
 import android.content.Context
 import android.content.pm.PackageManager
+import android.media.AudioDeviceInfo
 import android.media.AudioFormat
+import android.media.AudioManager
 import android.media.AudioRecord
 import android.media.MediaRecorder
 import android.util.Log
@@ -52,6 +54,22 @@ class VoiceSessionRecorder(private val context: Context) {
             rec.release()
             Log.w(TAG, "AudioRecord init failed for voice session")
             return false
+        }
+        // Route capture to the Built-In Back Mic. Empirically (MicConfigProbe,
+        // shiftmind.audioProbe) the back mic captures BOTH the wearer (-33 dBFS)
+        // and the far-field customer (-38 dBFS) better than the default primary
+        // input, which runs Qualcomm Fluence beamforming toward the wearer and
+        // spectrally mangles far-field speech so ASR drops the customer. Back
+        // mic is a different physical device → bypasses that beam. See
+        // CLAUDE.md "AudioRecord source on Rokid HAL" for why source-swapping
+        // is off the table (VOICE_RECOGNITION = silence, CAMCORDER/UNPROCESSED
+        // wedge Camera2); device routing is the safe lever.
+        val preferred = findBackMic()
+        if (preferred != null) {
+            val ok = rec.setPreferredDevice(preferred)
+            Log.i(TAG, "voice session setPreferredDevice(backMic id=${preferred.id}) -> $ok")
+        } else {
+            Log.w(TAG, "no Built-In Back Mic found — falling back to default input")
         }
         record = rec
         pcm = ByteArrayOutputStream()
@@ -178,6 +196,21 @@ class VoiceSessionRecorder(private val context: Context) {
         MediaRecorder.AudioSource.VOICE_RECOGNITION -> "VOICE_RECOGNITION"
         MediaRecorder.AudioSource.CAMCORDER -> "CAMCORDER"
         else -> "unknown($source)"
+    }
+
+    /**
+     * Find the Built-In Back Mic for setPreferredDevice. Mirrors MicConfigProbe's
+     * selection: prefer a BUILTIN_MIC whose product name contains "back", else
+     * the second BUILTIN_MIC entry (the array exposes two devices). Returns null
+     * if none — caller falls back to the default input.
+     */
+    private fun findBackMic(): AudioDeviceInfo? {
+        val am = context.getSystemService(AudioManager::class.java) ?: return null
+        val mics = am.getDevices(AudioManager.GET_DEVICES_ALL)
+            .filter { it.isSource && it.type == AudioDeviceInfo.TYPE_BUILTIN_MIC }
+        return mics.firstOrNull { it.productName.contains("back", ignoreCase = true) }
+            ?: mics.getOrNull(1)
+            ?: mics.firstOrNull()
     }
 
     companion object {
