@@ -382,7 +382,11 @@ class CameraPreviewStreamer(
             latestFaceBoxJson = null
             HudStateHolder.mutate {
                 it.copy(
-                    statusLine = if (result.faceDetected) "align face in box" else "awaiting customer",
+                    statusLine = when {
+                        result.faceNotFrontal -> "face the camera"
+                        result.faceDetected -> "align face in box"
+                        else -> "awaiting customer"
+                    },
                     customerCard = null,
                 )
             }

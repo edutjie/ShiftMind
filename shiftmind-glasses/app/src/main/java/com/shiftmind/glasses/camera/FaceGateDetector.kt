@@ -37,6 +37,9 @@ class FaceGateDetector(
     )
 
     private val busy = AtomicBoolean(false)
+    private val frameCandidates = ArrayDeque<FrameCandidate>(MIN_DIFF_WINDOW)
+    private var selectedCandidate: FrameCandidate? = null
+    private var consecutiveMisses = 0
 
     fun process(nv21: ByteArray, rotationDegrees: Int = 0) {
         if (!busy.compareAndSet(false, true)) return
@@ -69,22 +72,92 @@ class FaceGateDetector(
 
     private fun buildResult(nv21: ByteArray, faces: List<Face>): FaceGateResult {
         val cursor = cursorRect()
-        val best = faces
-            .map { it.boundingBox.clampToFrame() }
-            .filter { !it.isEmpty }
-            .maxByOrNull { intersectionArea(it, cursor) }
-            ?: return FaceGateResult(faceDetected = false, faceInCursor = false)
+        val bestFace = faces
+            .filter { !it.boundingBox.clampToFrame().isEmpty }
+            .maxByOrNull { intersectionArea(it.boundingBox.clampToFrame(), cursor) }
+            ?: return run {
+                consecutiveMisses++
+                val selected = selectedCandidate
+                if (selected != null && consecutiveMisses <= MAX_MISSED_DETECTIONS) {
+                    FaceGateResult(true, true, selected.faceBox, cursor, selected.crop)
+                } else {
+                    if (consecutiveMisses > MAX_MISSED_DETECTIONS) resetSelection()
+                    FaceGateResult(false, false)
+                }
+            }
+        consecutiveMisses = 0
+        val best = bestFace.boundingBox.clampToFrame()
 
         val overlap = intersectionArea(best, cursor)
         val faceInCursor = overlap > 0 && overlap.toFloat() / maxOf(1, best.width() * best.height()) >= MIN_FACE_OVERLAP
-        val crop = if (faceInCursor) cropFace(nv21, best) else null
+        val yaw = bestFace.headEulerAngleY
+        val faceFrontal = kotlin.math.abs(yaw) <= MAX_YAW_DEGREES
+        Log.d(TAG, "face pose: yaw=$yaw frontal=$faceFrontal")
+        if (!faceInCursor || !faceFrontal) resetSelection()
+
+        val selected = if (faceInCursor && faceFrontal) selectMinimumDiffFrame(nv21, best) else null
+        val accepted = selected != null
         return FaceGateResult(
             faceDetected = true,
-            faceInCursor = faceInCursor,
-            faceBox = best,
+            faceInCursor = accepted,
+            faceBox = selected?.faceBox ?: best,
             cursorBox = cursor,
-            faceCropJpeg = crop,
+            faceCropJpeg = selected?.crop,
+            faceNotFrontal = faceInCursor && !faceFrontal,
         )
+    }
+
+    private fun selectMinimumDiffFrame(nv21: ByteArray, faceBox: Rect): FrameCandidate? {
+        selectedCandidate?.let { return it }
+        val sampleBox = faceBox.expand(0.12f).clampToFrame()
+        val crop = cropFace(nv21, faceBox) ?: return null
+        frameCandidates.addLast(FrameCandidate(sampleLuma(nv21, sampleBox), Rect(faceBox), crop))
+        if (frameCandidates.size < MIN_DIFF_WINDOW) return null
+
+        val candidates = frameCandidates.toList()
+        var bestNewerIndex = 1
+        var bestDifference = Float.MAX_VALUE
+        for (i in 0 until candidates.lastIndex) {
+            val difference = meanAbsoluteDifference(candidates[i].luma, candidates[i + 1].luma)
+            if (difference < bestDifference) {
+                bestDifference = difference
+                bestNewerIndex = i + 1
+            }
+        }
+        return candidates[bestNewerIndex].also {
+            selectedCandidate = it
+            frameCandidates.clear()
+            Log.d(TAG, "minimum-diff frame selected: difference=$bestDifference")
+        }
+    }
+
+    private fun resetSelection() {
+        frameCandidates.clear()
+        selectedCandidate = null
+        consecutiveMisses = 0
+    }
+
+    /** Fixed-size sparse Y-plane sample, avoiding JPEG/RGB conversion. */
+    private fun sampleLuma(nv21: ByteArray, box: Rect): ByteArray {
+        val result = ByteArray(STABILITY_GRID * STABILITY_GRID)
+        var index = 0
+        for (gy in 0 until STABILITY_GRID) {
+            val y = box.top + (gy * box.height() + box.height() / 2) / STABILITY_GRID
+            for (gx in 0 until STABILITY_GRID) {
+                val x = box.left + (gx * box.width() + box.width() / 2) / STABILITY_GRID
+                result[index++] = nv21[y.coerceIn(0, frameHeight - 1) * frameWidth + x.coerceIn(0, frameWidth - 1)]
+            }
+        }
+        return result
+    }
+
+    private fun meanAbsoluteDifference(a: ByteArray, b: ByteArray): Float {
+        if (a.size != b.size || a.isEmpty()) return Float.MAX_VALUE
+        var sum = 0L
+        for (i in a.indices) {
+            sum += kotlin.math.abs((a[i].toInt() and 0xff) - (b[i].toInt() and 0xff))
+        }
+        return sum.toFloat() / a.size
     }
 
     private fun cursorRect(): Rect {
@@ -134,6 +207,10 @@ class FaceGateDetector(
         private const val TAG = "ShiftMind.FaceGate"
         private const val CURSOR_SIDE_RATIO = 0.52f
         private const val MIN_FACE_OVERLAP = 0.35f
+        private const val MAX_YAW_DEGREES = 25f
+        private const val STABILITY_GRID = 16
+        private const val MIN_DIFF_WINDOW = 3
+        private const val MAX_MISSED_DETECTIONS = 3
     }
 }
 
@@ -143,4 +220,7 @@ data class FaceGateResult(
     val faceBox: Rect? = null,
     val cursorBox: Rect? = null,
     val faceCropJpeg: ByteArray? = null,
+    val faceNotFrontal: Boolean = false,
 )
+
+private data class FrameCandidate(val luma: ByteArray, val faceBox: Rect, val crop: ByteArray)
