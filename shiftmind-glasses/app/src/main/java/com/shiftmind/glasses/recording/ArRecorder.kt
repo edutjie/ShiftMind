@@ -116,12 +116,10 @@ class ArRecorder(
                 val surface = Surface(surfaceTexture)
                 cameraSurface = surface
                 streamer.attachRecordingTarget(surface)
-                // Shared PTS anchor — both encoders rebase their timestamps to
-                // this monotonic-nanos value so the MP4 has a sane duration
-                // and audio+video stay in sync. Pick AFTER camera target is
-                // attached (close to first frame) for accuracy.
+                // One CLOCK_MONOTONIC origin for both delivered camera frames
+                // and captured PCM blocks keeps the MP4 timeline player-neutral.
                 val anchorNs = System.nanoTime()
-                comp.setPtsAnchor(anchorNs)
+                comp.setRecordingStartNs(anchorNs)
                 venc.start()
                 aenc?.start(anchorNs)
                 recording = true

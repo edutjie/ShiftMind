@@ -64,14 +64,9 @@ class HudCompositor(
     private val thread = HandlerThread("shiftmind-gl")
     private lateinit var handler: Handler
 
-    /**
-     * Monotonic-nanos anchor for video PTS. Set by [setPtsAnchor] before the
-     * first frame; if 0, the very first frame's SurfaceTexture timestamp is
-     * used (legacy behaviour). Audio + video share the same anchor so the MP4
-     * timeline matches across tracks.
-     */
-    @Volatile private var ptsAnchorNs: Long = 0L
-    fun setPtsAnchor(anchorNs: Long) { ptsAnchorNs = anchorNs }
+    /** Shared CLOCK_MONOTONIC origin used by both camera and microphone. */
+    @Volatile private var recordingStartNs: Long = 0L
+    fun setRecordingStartNs(value: Long) { recordingStartNs = value }
 
     private var egl: EglCore? = null
     private var windowSurface: WindowSurface? = null
@@ -186,8 +181,11 @@ class HudCompositor(
             // audio + video share the same monotonic-zero timeline. Without
             // this, video PTS is raw uptime-nanos and audio PTS is delta-nanos,
             // producing wildly wrong MP4 duration + audio/video desync.
-            val anchor = ptsAnchorNs
-            val pts = if (anchor > 0L) st.timestamp - anchor else st.timestamp
+            // Do not use SurfaceTexture.timestamp here. Rokid's camera producer
+            // has shown both a different epoch and a different effective rate,
+            // which makes players interpret A/V sync differently. Timestamp the
+            // delivered frame on the same CLOCK_MONOTONIC timeline as audio.
+            val pts = (System.nanoTime() - recordingStartNs).coerceAtLeast(0L)
             windowSurface!!.setPresentationTime(pts)
             if (!windowSurface!!.swap()) {
                 Log.w(TAG, "eglSwapBuffers failed")
