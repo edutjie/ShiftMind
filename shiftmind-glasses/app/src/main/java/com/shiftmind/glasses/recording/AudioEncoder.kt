@@ -2,13 +2,11 @@ package com.shiftmind.glasses.recording
 
 import android.media.AudioFormat
 import android.media.AudioRecord
+import android.media.AudioTimestamp
 import android.media.MediaCodec
 import android.media.MediaCodecInfo
 import android.media.MediaFormat
 import android.media.MediaRecorder
-import android.media.audiofx.AcousticEchoCanceler
-import android.media.audiofx.AutomaticGainControl
-import android.media.audiofx.NoiseSuppressor
 import android.os.Handler
 import android.os.HandlerThread
 import android.util.Log
@@ -59,14 +57,11 @@ class AudioEncoder(
     @Volatile private var stopRequested = false
     @Volatile private var draining = false
 
-    /**
-     * Shared session anchor kept for logging/API symmetry with video. Audio
-     * sample times are rebased to zero from [totalFramesRead]; using wall-clock
-     * after a blocking read delays the first AAC packet by the mic/codec warmup
-     * time (often ~150-200ms on Rokid).
-     */
-    private var startEpochNs: Long = 0L
     private var totalFramesRead: Long = 0L
+    // Use hardware timestamp as PTS anchor to get true sample rate.
+    private val audioTimestamp = AudioTimestamp()
+    private var firstHwTimestampNs: Long = 0L
+    private var framesAtFirstHwTimestamp: Long = 0L
 
     private val pcmReadBufSize: Int
     private val pcmTempBuf: ShortArray
@@ -85,25 +80,11 @@ class AudioEncoder(
 
     /** Build AudioRecord + codec. Call before [start]. */
     fun prepare() {
-        // Source selection on Rokid Max Pro (real-hardware findings, do NOT
-        // re-derive from theory — the order matters):
-        //   - MIC: heavy HAL AGC + NS. Speech buried in noise floor — RMS
-        //     mostly -50 to -90 dBFS, ×4 software gain just amplifies noise.
-        //   - VOICE_RECOGNITION: digital silence (hot-word DSP path).
-        //   - CAMCORDER: probing it back-to-back with startRecording() trips
-        //     a HAL race that wedges the Camera2 session and video frames
-        //     stop being delivered — observed empirically. Don't touch it
-        //     while the camera is open.
-        //   - UNPROCESSED: same risk as CAMCORDER.
-        //   - VOICE_COMMUNICATION: different DSP path from MIC. Try as primary.
-        // Strategy: open with VOICE_COMMUNICATION, then disable any AGC / NS /
-        // AEC effects the HAL attaches to the session. If VOICE_COMMUNICATION
-        // init fails on this HAL, fall back to MIC + ×4 software gain.
-        val record = openAudioRecord(MediaRecorder.AudioSource.VOICE_COMMUNICATION)
-            ?: openAudioRecord(MediaRecorder.AudioSource.MIC)
-            ?: error("AudioRecord failed for both VOICE_COMMUNICATION and MIC")
+        // MIC source matches VoiceSessionRecorder (ASR). Proven to work on
+        // Rokid HAL at declared 16kHz. No resampling, no timestamp correction.
+        val record = openAudioRecord(MediaRecorder.AudioSource.MIC)
+            ?: error("AudioRecord failed for MIC")
         audioRecord = record
-        disableHalPostProcessing(record.audioSessionId)
 
         val mediaFormat = MediaFormat.createAudioFormat(
             MediaFormat.MIMETYPE_AUDIO_AAC, sampleRate, /* channels= */ 1,
@@ -139,50 +120,8 @@ class AudioEncoder(
         null
     }
 
-    /**
-     * Disable HAL post-processing on the AudioRecord session. Rokid's MIC path
-     * applies aggressive AGC + NS that buries speech in the noise floor
-     * (~-90dBFS RMS even with ×4 software gain). Turning these off recovers
-     * raw mic levels at the cost of room noise. Whisper handles noise fine;
-     * it can't recover destroyed signal.
-     */
-    private fun disableHalPostProcessing(sessionId: Int) {
-        if (sessionId == AudioRecord.ERROR) return
-        runCatching {
-            if (AutomaticGainControl.isAvailable()) {
-                AutomaticGainControl.create(sessionId)?.apply {
-                    enabled = false
-                    Log.i(TAG, "AGC disabled on session $sessionId (was ${if (enabled) "on" else "off"})")
-                }
-            } else {
-                Log.i(TAG, "AGC effect not available on this HAL")
-            }
-        }.onFailure { Log.w(TAG, "AGC disable threw", it) }
-        runCatching {
-            if (NoiseSuppressor.isAvailable()) {
-                NoiseSuppressor.create(sessionId)?.apply {
-                    enabled = false
-                    Log.i(TAG, "NS disabled on session $sessionId")
-                }
-            } else {
-                Log.i(TAG, "NS effect not available on this HAL")
-            }
-        }.onFailure { Log.w(TAG, "NS disable threw", it) }
-        runCatching {
-            if (AcousticEchoCanceler.isAvailable()) {
-                AcousticEchoCanceler.create(sessionId)?.apply {
-                    enabled = false
-                    Log.i(TAG, "AEC disabled on session $sessionId")
-                }
-            } else {
-                Log.i(TAG, "AEC effect not available on this HAL")
-            }
-        }.onFailure { Log.w(TAG, "AEC disable threw", it) }
-    }
-
     fun start(startEpochNs: Long = System.nanoTime()) {
         check(codec != null && audioRecord != null) { "call prepare() first" }
-        this.startEpochNs = startEpochNs
         codec!!.start()
         audioRecord!!.startRecording()
         running = true
@@ -196,6 +135,15 @@ class AudioEncoder(
     fun stop(timeoutMs: Long = 2000) {
         if (!running) return
         stopRequested = true
+        // Log measured sample rate if hardware timestamps available
+        if (firstHwTimestampNs > 0L && audioTimestamp.framePosition > 0) {
+            val elapsedNs = audioTimestamp.nanoTime - firstHwTimestampNs
+            val capturedFrames = audioTimestamp.framePosition - framesAtFirstHwTimestamp
+            if (elapsedNs > 0L) {
+                val measuredRate = capturedFrames * 1_000_000_000L / elapsedNs
+                Log.i(TAG, "measured sample rate: ${measuredRate}Hz (declared ${sampleRate}Hz), captured ${capturedFrames}fr over ${elapsedNs / 1_000_000}ms")
+            }
+        }
         // Wait for the pump loop to push EOS through codec and drain.
         val deadline = System.nanoTime() + timeoutMs * 1_000_000L
         while (draining && System.nanoTime() < deadline) {
@@ -217,9 +165,9 @@ class AudioEncoder(
             }
             drainOutput()
             if (draining) {
-                // Keep looping. Use small delay so we don't busy-spin between
-                // 20ms PCM reads.
-                handler.postDelayed(::pumpLoop, 5)
+                // AudioRecord.read() is blocking, so no artificial delay is
+                // needed here. A delay changes the observed capture cadence.
+                handler.post(::pumpLoop)
             }
         } catch (t: Throwable) {
             Log.e(TAG, "audio pump loop crashed", t)
@@ -242,27 +190,46 @@ class AudioEncoder(
             c.queueInputBuffer(inIdx, 0, 0, computePtsUs(), MediaCodec.BUFFER_FLAG_END_OF_STREAM)
             return
         }
+
+        // Track hardware timestamp to measure actual sample rate (HAL may
+        // deliver faster than declared 16kHz). Use for PTS, not resampling.
+        if (!eos && framesRead > 0) {
+            val tsOk = rec.getTimestamp(audioTimestamp, AudioTimestamp.TIMEBASE_MONOTONIC)
+            if (tsOk == AudioRecord.SUCCESS && audioTimestamp.framePosition > 0) {
+                if (firstHwTimestampNs == 0L) {
+                    firstHwTimestampNs = audioTimestamp.nanoTime
+                    framesAtFirstHwTimestamp = audioTimestamp.framePosition
+                    Log.d(TAG, "first HW ts: ${audioTimestamp.nanoTime}ns @ frame ${audioTimestamp.framePosition}")
+                }
+            }
+        }
+
         val byteCount = framesRead * 2
         if (byteCount > 0) {
-            // Software gain. Rokid HAL applies aggressive AGC + NS to MIC source
-            // so spoken-voice peaks land around -19dBFS and means around -59dBFS
-            // — quiet but audible. We boost ×4 (~+12dB) with hard-clip to keep
-            // Whisper happy without making clipping audibly obvious. Override
-            // by setting [softwareGain] to 1.0f to disable.
+            // Direct copy with software gain. No resampling - preserve voice quality.
             for (i in 0 until framesRead) {
-                val boosted = (pcmTempBuf[i].toInt() * softwareGain).toInt()
+                val sample = pcmTempBuf[i]
+                val boosted = (sample * softwareGain).toInt()
                     .coerceIn(Short.MIN_VALUE.toInt(), Short.MAX_VALUE.toInt())
                 inBuf.put((boosted and 0xFF).toByte())
                 inBuf.put(((boosted shr 8) and 0xFF).toByte())
             }
         }
+
         val ptsUs = computePtsUs()
-        totalFramesRead += framesRead
+        totalFramesRead += framesRead.toLong()
         val flags = if (eos) MediaCodec.BUFFER_FLAG_END_OF_STREAM else 0
         c.queueInputBuffer(inIdx, 0, byteCount, ptsUs, flags)
     }
 
     private fun computePtsUs(): Long {
+        // If hardware timestamp available, use it to compute PTS based on actual
+        // sample rate delivered by HAL (may differ from declared 16kHz).
+        // Otherwise fallback to declared sample rate.
+        if (firstHwTimestampNs > 0L && audioTimestamp.framePosition > 0) {
+            val elapsedNs = audioTimestamp.nanoTime - firstHwTimestampNs
+            return elapsedNs / 1_000L
+        }
         return totalFramesRead * 1_000_000L / sampleRate
     }
 
