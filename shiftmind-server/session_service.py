@@ -8,6 +8,7 @@ import time
 from dataclasses import dataclass
 from typing import Any
 
+from auth import active_login
 from face_recognition_service import MODEL_NAME, RecognitionResult, get_face_service
 from storage import storage
 
@@ -58,11 +59,17 @@ class SessionService:
                 self._active = _active_from_row(row)
                 return self._active
 
+            login = active_login.read()
             if result.status == "confirmed" and result.person_id:
                 customer = storage.get_customer(result.person_id)
                 if not customer:
                     return None
-                session = storage.create_customer_session(customer_id=customer.id, is_new_customer=False)
+                session = storage.create_customer_session(
+                    customer_id=customer.id,
+                    is_new_customer=False,
+                    employee_id=login.employee_id if login else None,
+                    location_id=login.location_id if login else None,
+                )
                 self._active = ActiveSession(
                     session_id=session["id"],
                     customer_id=customer.id,
@@ -83,7 +90,12 @@ class SessionService:
                 memory_card=memory_card,
                 crop_jpeg=crop_jpeg,
             )
-            session = storage.create_customer_session(customer_id=customer_id, is_new_customer=True)
+            session = storage.create_customer_session(
+                customer_id=customer_id,
+                is_new_customer=True,
+                employee_id=login.employee_id if login else None,
+                location_id=login.location_id if login else None,
+            )
             self._active = ActiveSession(
                 session_id=session["id"],
                 customer_id=customer_id,
@@ -108,6 +120,7 @@ class SessionService:
             transcript, llm_status = _transcribe_audio(audio_bytes)
         summary_data = _summarize_session(
             customer_id=str(row["customer_id"]),
+            session_id=session_id,
             existing_name=str(row.get("customer_name") or ""),
             existing_memory=str(row.get("memory_card") or ""),
             is_new_customer=bool(row.get("is_new_customer")),
@@ -119,6 +132,8 @@ class SessionService:
         summary = str(summary_data.get("summary") or "").strip() or "Session ended. No transcript summary available yet."
         points = [str(p).strip() for p in summary_data.get("important_points", []) if str(p).strip()]
         extracted_name = str(summary_data.get("name") or "").strip()
+        topics = [str(t).strip() for t in summary_data.get("topics", []) if str(t).strip()]
+        outcome = str(summary_data.get("outcome") or "unknown").strip() or "unknown"
 
         finished = storage.finish_customer_session(
             session_id=session_id,
@@ -126,7 +141,30 @@ class SessionService:
             summary=summary,
             important_points=points,
             audio_bytes=audio_bytes,
+            topics=topics,
+            outcome=outcome,
         )
+
+        # Best-effort semantic-index upsert for the Q&A agent. Never let a
+        # Milvus/embedding failure break session finish — the storage UPDATE
+        # above has already committed.
+        try:
+            content = (summary + "\n" + "; ".join(points)).strip()
+            if content and not content.startswith("Session ended."):
+                from session_memory_service import get_memory_service
+
+                get_memory_service().upsert_memory(
+                    memory_id=f"mem-{session_id}",
+                    session_id=session_id,
+                    customer_id=str(row["customer_id"]),
+                    employee_id=(row.get("employee_id") or None),
+                    location_id=(row.get("location_id") or None),
+                    content=content,
+                    outcome=outcome,
+                    started_at_iso=str(row.get("started_at") or ""),
+                )
+        except Exception as exc:
+            print(f"[finish] session_memories upsert failed: {type(exc).__name__}: {exc}")
 
         customer = storage.get_customer(str(row["customer_id"]))
         if customer:
@@ -209,7 +247,7 @@ def _active_from_row(row: dict[str, Any]) -> ActiveSession:
 
 
 def _openai_client() -> Any | None:
-    api_key = os.getenv("OPENAI_API_KEY") or os.getenv("SHIFTMIND_LLM_API_KEY")
+    api_key = os.getenv("SHIFTMIND_LLM_API_KEY") or os.getenv("OPENAI_API_KEY")
     if not api_key:
         return None
     try:
@@ -217,7 +255,7 @@ def _openai_client() -> Any | None:
     except Exception:
         return None
     kwargs: dict[str, Any] = {"api_key": api_key}
-    base_url = os.getenv("OPENAI_BASE_URL") or os.getenv("SHIFTMIND_LLM_BASE_URL")
+    base_url = os.getenv("SHIFTMIND_LLM_BASE_URL") or os.getenv("OPENAI_BASE_URL")
     if base_url:
         kwargs["base_url"] = base_url
     return OpenAI(**kwargs)
@@ -242,6 +280,7 @@ def _transcribe_audio(audio_bytes: bytes) -> tuple[str, str]:
 def _summarize_session(
     *,
     customer_id: str,
+    session_id: str | None = None,
     existing_name: str,
     existing_memory: str,
     is_new_customer: bool,
@@ -252,6 +291,8 @@ def _summarize_session(
             "summary": "Session ended. No transcript captured.",
             "important_points": [],
             "name": "" if not is_new_customer else "",
+            "topics": [],
+            "outcome": "unknown",
             "_llm_status": "no_transcript",
         }
     client = _openai_client()
@@ -260,6 +301,8 @@ def _summarize_session(
             "summary": transcript[:500],
             "important_points": [],
             "name": "" if not is_new_customer else "",
+            "topics": [],
+            "outcome": "unknown",
             "_llm_status": "missing_openai_config",
         }
     model = os.getenv("SHIFTMIND_LLM_MODEL", "gpt-4o-mini")
@@ -270,6 +313,13 @@ def _summarize_session(
         context += f"\nKnown name: {existing_name}"
     if existing_memory:
         context += f"\nExisting memory card: {existing_memory}"
+    last = storage.get_last_interaction_by_customer(customer_id, exclude_session_id=session_id)
+    if last and last.get("employee_name"):
+        context += f"\nLast employee who interacted with this customer: {last['employee_name']}"
+        if last.get("location_name"):
+            context += f" at {last['location_name']}"
+        if last.get("ended_at"):
+            context += f" on {last['ended_at']}"
 
     system_prompt = (
         "You are a retail assistant that extracts key customer information from interaction transcripts. "
@@ -277,7 +327,11 @@ def _summarize_session(
         "Extract and return ONLY valid JSON with these keys:\n"
         "- summary: A brief 1-2 sentence summary of this interaction\n"
         "- important_points: Array of durable facts/preferences (likes, dislikes, needs, personal info)\n"
-        "- name: Customer's name if mentioned in transcript (empty string otherwise)\n\n"
+        "- name: Customer's name if mentioned in transcript (empty string otherwise)\n"
+        "- topics: Array of 1-5 short lowercase tags describing what the conversation was about "
+        "(e.g. [\"returns\",\"warranty\",\"refund\"], [\"football boots\",\"sizing\"])\n"
+        "- outcome: One of \"converted\" (customer committed to a purchase/booking), "
+        "\"not_converted\" (left without committing), or \"unknown\" (can't tell)\n\n"
         "Focus on NEW information from this transcript. If there's existing memory, ADD to it, don't repeat it."
     )
 
@@ -296,6 +350,13 @@ def _summarize_session(
         text = resp.choices[0].message.content or ""
         parsed = json.loads(text)
         if isinstance(parsed, dict):
+            # Coerce topics/outcome so downstream code can rely on the keys
+            # existing even if the LLM omitted them.
+            if not isinstance(parsed.get("topics"), list):
+                parsed["topics"] = []
+            parsed["topics"] = [str(t).strip().lower() for t in parsed["topics"] if str(t).strip()]
+            outcome = str(parsed.get("outcome") or "unknown").strip().lower()
+            parsed["outcome"] = outcome if outcome in {"converted", "not_converted", "unknown"} else "unknown"
             parsed["_llm_status"] = "summarized"
             return parsed
     except Exception as exc:
@@ -303,9 +364,18 @@ def _summarize_session(
             "summary": transcript[:500],
             "important_points": [],
             "name": "",
+            "topics": [],
+            "outcome": "unknown",
             "_llm_status": f"summarize_failed:{type(exc).__name__}",
         }
-    return {"summary": transcript[:500], "important_points": [], "name": "", "_llm_status": "summarize_parse_failed"}
+    return {
+        "summary": transcript[:500],
+        "important_points": [],
+        "name": "",
+        "topics": [],
+        "outcome": "unknown",
+        "_llm_status": "summarize_parse_failed",
+    }
 
 
 def _update_memory_card_with_llm(
@@ -359,7 +429,12 @@ def _update_memory_card_with_llm(
                 points = []
 
             if summary:
-                history_lines.append(f"Session {i}: {summary}")
+                emp = session.get("employee_name")
+                loc = session.get("location_name")
+                who = ""
+                if emp:
+                    who = f" (with {emp}" + (f", {loc}" if loc else "") + ")"
+                history_lines.append(f"Session {i}: {summary}{who}")
                 if points:
                     history_lines.append(f"  Facts: {', '.join(points[:3])}")
 

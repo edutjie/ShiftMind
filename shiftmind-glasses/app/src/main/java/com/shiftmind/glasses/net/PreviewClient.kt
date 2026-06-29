@@ -88,6 +88,17 @@ class PreviewClient(private val baseUrl: String = BuildConfig.SERVER_URL) {
         val root = runCatching { JSONObject(body) }.getOrNull() ?: return
         val activeSession = root.optJSONObject("active_session")
         activeSession?.let { applyActiveSession(it) }
+        val activeEmployee = root.optJSONObject("active_employee")
+        if (activeEmployee != null) {
+            val update = resolveEmployeeHudUpdate(
+                active = activeEmployee.optBoolean("active", false),
+                employeeName = activeEmployee.optString("employee_name"),
+                locationName = activeEmployee.optString("location_name"),
+            )
+            HudStateHolder.mutate {
+                it.copy(employeeName = update.employeeName, locationName = update.locationName)
+            }
+        }
         val recognition = runCatching {
             root.optJSONObject("recognition")
         }.getOrNull() ?: return
@@ -162,4 +173,22 @@ class PreviewClient(private val baseUrl: String = BuildConfig.SERVER_URL) {
     companion object {
         private const val TAG = "ShiftMind.Preview"
     }
+}
+
+internal data class EmployeeHudUpdate(
+    val employeeName: String?,
+    val locationName: String?,
+)
+
+/** Pure mapping kept separate so logout/null handling is covered by JVM tests. */
+internal fun resolveEmployeeHudUpdate(
+    active: Boolean,
+    employeeName: String?,
+    locationName: String?,
+): EmployeeHudUpdate {
+    if (!active) return EmployeeHudUpdate(employeeName = null, locationName = null)
+    return EmployeeHudUpdate(
+        employeeName = employeeName?.takeIf { it.isNotBlank() },
+        locationName = locationName?.takeIf { it.isNotBlank() },
+    )
 }

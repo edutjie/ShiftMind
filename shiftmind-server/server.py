@@ -8,7 +8,7 @@ from __future__ import annotations
 from dotenv import load_dotenv
 from fastapi import FastAPI
 
-from api import detect_face, faces, health, preview, sessions
+from api import auth, detect_face, faces, health, preview, qa, sessions
 from session_service import session_service
 from storage import storage
 
@@ -28,10 +28,12 @@ async def _clear_stale_sessions() -> None:
 
 
 app.include_router(health.router)
+app.include_router(auth.router)
 app.include_router(detect_face.router)
 app.include_router(faces.router)
 app.include_router(preview.router)
 app.include_router(sessions.router)
+app.include_router(qa.router)
 
 
 @app.get("/")
@@ -41,6 +43,12 @@ async def root() -> dict:
         "version": "0.1.0",
         "endpoints": [
             "/api/health",
+            "/api/whoami",
+            "/api/login.html",
+            "/api/login",
+            "/api/logout",
+            "/api/admin/employee",
+            "/api/admin/location",
             "/api/detect-face",
             "/api/enroll-face",
             "/api/faces.html",
@@ -55,6 +63,8 @@ async def root() -> dict:
             "/api/session/{session_id}/audio-stream",
             "/api/session/{session_id}/finish",
             "/api/sessions",
+            "/api/qa.html",
+            "/api/qa/ask",
         ],
     }
 

@@ -22,8 +22,10 @@ def test_llm_client():
         return False
 
     print("✅ OpenAI client configured")
-    print(f"   API Key: {os.getenv('OPENAI_API_KEY')[:20]}...")
-    print(f"   Base URL: {os.getenv('OPENAI_BASE_URL', 'default')}")
+    api_key = os.getenv("SHIFTMIND_LLM_API_KEY") or os.getenv("OPENAI_API_KEY") or ""
+    base_url = os.getenv("SHIFTMIND_LLM_BASE_URL") or os.getenv("OPENAI_BASE_URL") or "default"
+    print(f"   API Key: {api_key[:20]}...")
+    print(f"   Base URL: {base_url}")
     print(f"   Model: {os.getenv('SHIFTMIND_LLM_MODEL', 'gpt-4o-mini')}")
     return True
 

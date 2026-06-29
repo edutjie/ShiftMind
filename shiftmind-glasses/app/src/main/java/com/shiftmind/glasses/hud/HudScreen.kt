@@ -99,6 +99,13 @@ fun HudScreen() {
                     fontSize = 12.sp,
                 )
             }
+            val who = listOfNotNull(state.employeeName, state.locationName).joinToString(" · ")
+            Spacer(Modifier.height(2.dp))
+            if (who.isNotBlank()) {
+                Text(text = who, color = Color(0xFF00FF00).copy(alpha = 0.55f), fontSize = 10.sp)
+            } else {
+                Text(text = "log in at /api/login.html", color = Color.White.copy(alpha = 0.4f), fontSize = 9.sp)
+            }
         }
 
         // Recording indicator — bright red dot in top-right corner.

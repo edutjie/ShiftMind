@@ -52,10 +52,25 @@ Session finish works without credentials, but only stores a fallback "no transcr
 summary. Add these for OpenAI-compatible summary/fallback transcription:
 
 ```bash
-OPENAI_API_KEY=...
-OPENAI_BASE_URL=...              # optional OpenAI-compatible base URL
+SHIFTMIND_LLM_API_KEY=...
+SHIFTMIND_LLM_BASE_URL=...       # optional OpenAI-compatible base URL
 SHIFTMIND_TRANSCRIBE_MODEL=whisper-large-v3-turbo
 SHIFTMIND_LLM_MODEL="gpt-5.4-mini"
+```
+
+`OPENAI_API_KEY` / `OPENAI_BASE_URL` remain backward-compatible fallbacks.
+
+The Q&A agent uses the LLM client above. Text embeddings can use a separate
+OpenAI-compatible provider and land in a second Milvus Lite collection
+(`session_memories`); the dim is fixed at collection creation, so set these
+before the first run (and don't change them afterward without dropping the
+collection):
+
+```bash
+SHIFTMIND_EMBED_API_KEY=...
+SHIFTMIND_EMBED_BASE_URL=...                    # optional; falls back to shared/LLM URL
+SHIFTMIND_EMBED_MODEL=text-embedding-3-small   # any OpenAI-compatible embeddings model
+SHIFTMIND_EMBED_DIM=1536                       # must match the model's output dim
 ```
 
 ## Endpoints
@@ -75,6 +90,11 @@ SHIFTMIND_LLM_MODEL="gpt-5.4-mini"
 | `/api/preview-face` | GET | Live MJPEG stream of the latest face crop. |
 | `/api/preview.html` | GET | Convenience page showing HUD preview + latest face crop. |
 | `/api/preview-status` | GET | Preview, face crop, and recognition status JSON. |
+| `/api/qa.html` | GET | Q&A agent page. Employee types a business-insight question; the agent calls `run_sql` / `vector_search` tools and renders the answer + tool trace + sources. |
+| `/api/qa/ask` | POST | JSON `{question, filters?}`. Runs the tool-calling loop, returns `{answer, short_answer, trace, sources, iterations, elapsed_ms}`. |
+| `/api/qa/filters` | GET | Dropdown options (locations, employees, top topics, date range) for the Q&A filter bar. |
+| `/api/qa/suggestions` | GET | Suggested-question chips from real DB stats. `?creative=1` for LLM-generated. |
+| `/api/qa/snapshot` | GET | Pre-baked stats dashboard (totals, conversion, top topics/employees/locations). `?narrative=1` adds an LLM summary. |
 
 ## Face recognition dev flow
 
@@ -90,8 +110,8 @@ SHIFTMIND_LLM_MODEL="gpt-5.4-mini"
 
 Data lives under `shiftmind-server/data/` and is gitignored:
 
-- `shiftmind.sqlite3` — customers, face images, recognition events.
-- `milvus/shiftmind.db` — Milvus Lite vector store.
+- `shiftmind.sqlite3` — customers, face images, recognition events, customer sessions.
+- `milvus/shiftmind.db` — Milvus Lite vector store (`face_embeddings` + `session_memories` collections).
 - `faces/*.jpg` — saved enrollment crops.
 - `audio/*.wav` — uploaded customer-session voice recordings.
 
@@ -103,13 +123,83 @@ ShiftMind keeps per-interaction notes separate from the long-lived memory card:
 | :--- | :--- | :--- |
 | `customer_sessions.summary` | One session | Immutable summary of the completed interaction. |
 | `customer_sessions.important_points_json` | One session | Extracted facts from that interaction. |
+| `customer_sessions.topics_json` | One session | 1–5 lowercase topic tags (e.g. `["returns","warranty"]`), used for "popular topic" queries. |
+| `customer_sessions.outcome` | One session | `converted` / `not_converted` / `unknown` — drives conversion-rate questions. |
+| `customer_sessions.duration_seconds` | One session | Conversation length, derived at finish — drives "longest conversation" queries. |
 | `customers.memory_card` | Customer lifetime | Concise cumulative memory shown on the glasses HUD. |
 
 At session finish, the server uses the configured OpenAI-compatible chat
-completion API to summarize the transcript as JSON, then re-summarizes the
-cumulative `customers.memory_card` so it stays short enough for AR display.
-If LLM credentials are missing or unavailable, the fallback keeps a bounded
-summary rather than appending unbounded raw transcripts.
+completion API to summarize the transcript as JSON (summary, important
+points, name, topics, outcome), then re-summarizes the cumulative
+`customers.memory_card` so it stays short enough for AR display, and upserts
+a `session_memories` vector (summary + points) into Milvus Lite for semantic
+recall by the Q&A agent. If LLM credentials are missing or unavailable, the
+fallback keeps a bounded summary rather than appending unbounded raw
+transcripts.
+
+## Q&A agent
+
+`/api/qa.html` exposes a tool-calling agent over the collected interaction
+history. An OpenAI-compatible chat loop picks between six tools per question:
+
+- `run_sql` — read-only SELECT against SQLite (counts, rates, rankings, time
+  trends, filters by employee/location/outcome/date). Driver-level `mode=ro`
+  plus a statement guard and a 50-row cap; writes/DDL/multi-statement rejected.
+- `vector_search` — semantic search over the `session_memories` Milvus
+  collection (topical/free-form recall), filterable by employee/location/date.
+- `search_customers` → `customer_profile` — resolve a customer by name/topic,
+  then pull their full profile (sessions, topics, outcomes, memory_card,
+  preferences, first/last seen). For "tell me about the customer who…".
+- `compare` — side-by-side stats for two employees or two locations.
+- `find_outliers` — anomalies: longest sessions, employees far from mean
+  conversion, topics with abnormally long discussions.
+
+The page renders the agent's markdown answer (lists, bold, code), shows a
+tool-call trace + source sessions, and exposes:
+
+- **Filters** (location, employee, topic, date range, simulated/real toggle) —
+  passed to the agent as a MANDATORY SCOPE block for `run_sql` and applied
+  programmatically to `vector_search`. Filters also scope the overview +
+  suggestions. `GET /api/qa/filters` populates the dropdowns.
+- **Suggested questions** — generated from real (scoped) DB stats; "🎲 surprise
+  me" asks the LLM for creative dataset-specific questions.
+  `GET /api/qa/suggestions?creative=1`.
+- **Overview dashboard** — `GET /api/qa/snapshot?narrative=1` returns scoped
+  totals, conversion rate, avg duration, top topics/employees/locations, and an
+  LLM narrative; rendered as stat cards.
+- **Conversation memory** — prior turns are sent with each ask so follow-ups
+  ("and for last week?") resolve against context. "↺ clear chat" resets.
+- **`short_answer`** — every `/api/qa/ask` response includes a ≤140-char
+  plain-text distillation for the eventual AR-glasses HUD (matches the
+  `liveTranscript` budget). Glasses-side rendering is a future change.
+
+Simulated dataset for paper testing (`scripts/seed_simulated.py`, prefix-isolated
+`sim-*` cohort, non-destructive):
+
+```bash
+uv run python -m scripts.seed_simulated --months 6 --sessions 200   # spans ~6 months
+uv run python -m scripts.normalize_sim_data                          # canonicalize outcomes
+uv run python -m scripts.clean_test_artifacts                        # remove dev/test-fixture rows
+```
+
+Backfill older sessions (summarized before topics/outcome existed) with:
+
+```bash
+uv run python -m scripts.backfill_qa --dry-run
+uv run python -m scripts.backfill_qa --limit 10
+uv run python -m scripts.backfill_qa --reindex   # re-embed ALL sessions into Milvus
+```
+
+`customer_sessions` / `customers` / `employees` carry an `is_simulated` flag
+(1 = seeded demo data, 0 = real capture). Simulated data is included in
+queries by default; the agent filters to `is_simulated = 0` only when you
+explicitly ask for "real"/"production" data. Normalize a legacy seed
+dataset's free-form outcomes onto the canonical enum and flag `sim-*` rows
+with:
+
+```bash
+uv run python -m scripts.normalize_sim_data
+```
 
 The glasses HUD treats stored memory and current speech as separate surfaces:
 `CustomerCard.memoryLine` is previous-session memory, while
