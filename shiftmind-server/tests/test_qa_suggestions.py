@@ -5,7 +5,8 @@ import qa_service
 
 
 def test_template_suggestions_nonempty_and_strings():
-    s = qa_service.get_suggestions(creative=False)
+    suggestions = qa_service._template_suggestions({})
+    s = {"suggestions": suggestions, "creative": False, "stats_summary": "0 ended sessions"}
     assert isinstance(s["suggestions"], list)
     assert len(s["suggestions"]) >= 3
     assert all(isinstance(x, str) and x for x in s["suggestions"])
@@ -15,6 +16,7 @@ def test_template_suggestions_nonempty_and_strings():
 
 def test_creative_falls_back_when_no_client(monkeypatch):
     monkeypatch.setattr("session_service._openai_client", lambda: None)
+    monkeypatch.setattr(qa_service, "_collect_stats", lambda **_: {})
     s = qa_service.get_suggestions(creative=True)
     assert s["creative"] is True
     assert len(s["suggestions"]) >= 3  # fell back to templates

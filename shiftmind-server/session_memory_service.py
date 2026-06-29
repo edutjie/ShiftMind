@@ -7,9 +7,8 @@ summary + important_points so the agent can do semantic/topical recall
 The face service remains the only store for face vectors.
 
 Mirrors face_recognition_service.py's client/schema/index/search/singleton
-pattern. Text embeddings come from the same OpenAI-compatible client the
-LLM summarizer already uses (session_service._openai_client), so no new
-credentials or heavy dependency.
+pattern. Text embeddings use their own OpenAI-compatible client configuration,
+with the shared/LLM settings retained as backward-compatible fallbacks.
 """
 from __future__ import annotations
 
@@ -26,6 +25,30 @@ MODEL_NAME = os.getenv("SHIFTMIND_EMBED_MODEL", "text-embedding-3-small")
 EMBED_DIM = int(os.getenv("SHIFTMIND_EMBED_DIM", "1536"))
 MAX_CONTENT_CHARS = 4000
 _ISO_FMT = "%Y-%m-%dT%H:%M:%SZ"
+
+
+def _embedding_client() -> Any | None:
+    """Dedicated embeddings client with backward-compatible shared fallbacks."""
+    api_key = (
+        os.getenv("SHIFTMIND_EMBED_API_KEY")
+        or os.getenv("OPENAI_API_KEY")
+        or os.getenv("SHIFTMIND_LLM_API_KEY")
+    )
+    if not api_key:
+        return None
+    try:
+        from openai import OpenAI
+    except Exception:
+        return None
+    kwargs: dict[str, Any] = {"api_key": api_key}
+    base_url = (
+        os.getenv("SHIFTMIND_EMBED_BASE_URL")
+        or os.getenv("OPENAI_BASE_URL")
+        or os.getenv("SHIFTMIND_LLM_BASE_URL")
+    )
+    if base_url:
+        kwargs["base_url"] = base_url
+    return OpenAI(**kwargs)
 
 
 class SessionMemoryService:
@@ -59,11 +82,9 @@ class SessionMemoryService:
 
     def embed_text(self, text: str) -> list[float]:
         """Embed text via the OpenAI-compatible API. Raises if unconfigured."""
-        from session_service import _openai_client
-
-        client = _openai_client()
+        client = _embedding_client()
         if client is None:
-            raise RuntimeError("missing_openai_config")
+            raise RuntimeError("missing_embedding_config")
         resp = client.embeddings.create(model=MODEL_NAME, input=text)
         return list(resp.data[0].embedding)
 

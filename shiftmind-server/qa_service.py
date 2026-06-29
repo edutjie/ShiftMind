@@ -10,8 +10,8 @@ The agent decides which tool(s) to call per question (often both). The loop
 returns the final answer plus a tool-call trace and source session_ids for
 the UI to render.
 
-Reuses session_service._openai_client (same OPENAI_API_KEY / base URL the
-summarizer uses) and session_memory_service.get_memory_service for vectors.
+Reuses session_service._openai_client for chat and the independently configured
+session_memory_service client for embeddings/vector search.
 """
 from __future__ import annotations
 
@@ -20,6 +20,8 @@ import os
 import re
 import sqlite3
 import time
+from contextlib import contextmanager
+from collections.abc import Iterator
 from typing import Any
 
 from storage import storage
@@ -27,6 +29,7 @@ from storage import storage
 MAX_ITERATIONS = 6
 TOOL_RESULT_MAX_CHARS = 4000
 SQL_ROW_CAP = 50
+_QA_TABLES = {"customer_sessions", "customers", "employees", "locations", "json_each"}
 
 # Keywords that have no business in a read-only SELECT. Belt-and-suspenders
 # on top of the driver-level mode=ro connection.
@@ -222,7 +225,114 @@ TOOLS = [
 # ── tool: run_sql ──────────────────────────────────────────────────────────
 
 
-def _tool_run_sql(sql: str) -> dict[str, Any]:
+def _normalize_filters(filters: dict[str, Any] | None) -> dict[str, str]:
+    """Return the supported UI scope in a stable, validated representation."""
+    raw = filters or {}
+    out: dict[str, str] = {}
+    for key in ("location_id", "employee_id", "customer_id", "topic", "date_from", "date_to"):
+        value = str(raw.get(key) or "").strip()
+        if value:
+            out[key] = value
+    simulated = str(raw.get("simulated") or "all").strip().lower()
+    if simulated in {"real", "sim"}:
+        out["simulated"] = simulated
+    return out
+
+
+def _scope_clause(filters: dict[str, Any] | None, alias: str = "s") -> tuple[str, list[Any]]:
+    """Parameterized WHERE conditions shared by snapshots and vector post-filtering."""
+    f = _normalize_filters(filters)
+    clauses: list[str] = []
+    params: list[Any] = []
+    if f.get("location_id"):
+        clauses.append(f"{alias}.location_id = ?")
+        params.append(f["location_id"])
+    if f.get("employee_id"):
+        clauses.append(f"{alias}.employee_id = ?")
+        params.append(f["employee_id"])
+    if f.get("customer_id"):
+        clauses.append(f"{alias}.customer_id = ?")
+        params.append(f["customer_id"])
+    if f.get("date_from"):
+        clauses.append(f"{alias}.started_at >= ?")
+        params.append(f"{f['date_from']}T00:00:00Z")
+    if f.get("date_to"):
+        clauses.append(f"{alias}.started_at <= ?")
+        params.append(f"{f['date_to']}T23:59:59Z")
+    if f.get("simulated"):
+        clauses.append(f"{alias}.is_simulated = ?")
+        params.append(0 if f["simulated"] == "real" else 1)
+    if f.get("topic"):
+        clauses.append(
+            f"EXISTS (SELECT 1 FROM json_each({alias}.topics_json) "
+            "WHERE LOWER(value) LIKE LOWER(?))"
+        )
+        params.append(f"%{f['topic']}%")
+    return (" AND ".join(clauses) or "1=1"), params
+
+
+def _scoped_session_ids(filters: dict[str, Any] | None) -> set[str] | None:
+    """Allowed session ids, or None when no UI scope was requested."""
+    normalized = _normalize_filters(filters)
+    if not normalized:
+        return None
+    where, params = _scope_clause(normalized)
+    with storage.connect() as conn:
+        rows = conn.execute(
+            f"SELECT s.id FROM customer_sessions s WHERE {where}", params
+        ).fetchall()
+    return {str(row["id"]) for row in rows}
+
+
+@contextmanager
+def _scoped_connection(filters: dict[str, Any] | None = None) -> Iterator[sqlite3.Connection]:
+    """Yield an isolated SQLite snapshot containing only rows inside the UI scope.
+
+    The agent can issue flexible SELECTs, but the connection contains only the four
+    Q&A tables and only sessions (plus related dimension rows) allowed by the scope.
+    """
+    source = storage.connect()
+    snapshot = sqlite3.connect(":memory:")
+    snapshot.row_factory = sqlite3.Row
+    try:
+        source.backup(snapshot)
+        snapshot.execute("PRAGMA foreign_keys = OFF")
+        for table in ("face_images", "recognition_events"):
+            snapshot.execute(f"DROP TABLE IF EXISTS {table}")
+
+        where, params = _scope_clause(filters)
+        snapshot.execute(
+            f"DELETE FROM customer_sessions WHERE id NOT IN "
+            f"(SELECT s.id FROM customer_sessions s WHERE {where})",
+            params,
+        )
+        snapshot.execute(
+            "DELETE FROM customers WHERE id NOT IN "
+            "(SELECT DISTINCT customer_id FROM customer_sessions)"
+        )
+        snapshot.execute(
+            "DELETE FROM employees WHERE id NOT IN "
+            "(SELECT DISTINCT employee_id FROM customer_sessions WHERE employee_id IS NOT NULL)"
+        )
+        snapshot.execute(
+            "DELETE FROM locations WHERE id NOT IN "
+            "(SELECT DISTINCT location_id FROM customer_sessions WHERE location_id IS NOT NULL)"
+        )
+        snapshot.commit()
+
+        def authorize(action: int, arg1: str | None, _arg2: str | None, _db: str | None, _trigger: str | None) -> int:
+            if action == sqlite3.SQLITE_READ and arg1 not in _QA_TABLES:
+                return sqlite3.SQLITE_DENY
+            return sqlite3.SQLITE_OK
+
+        snapshot.set_authorizer(authorize)
+        yield snapshot
+    finally:
+        source.close()
+        snapshot.close()
+
+
+def _tool_run_sql(sql: str, filters: dict[str, Any] | None = None) -> dict[str, Any]:
     """Execute a read-only SELECT. Always returns a dict, never raises."""
     # Strip leading line comments (-- ...) so the first token is the statement verb.
     stripped = re.sub(r"^\s*--[^\n]*\n", "", sql or "", flags=re.MULTILINE).strip()
@@ -244,16 +354,17 @@ def _tool_run_sql(sql: str) -> dict[str, Any]:
         if re.search(rf"\b{bad}\b", body, re.IGNORECASE):
             return {"error": f"disallowed keyword: {bad}", "_rejected": True}
 
-    uri = f"file:{storage.path.as_posix()}?mode=ro&uri=true"
+    if re.search(r"\b(?:main|temp)\s*\.", body, re.IGNORECASE) or re.search(
+        r"\bsqlite_", body, re.IGNORECASE
+    ):
+        return {"error": "schema-qualified and internal SQLite access is not allowed", "_rejected": True}
+
     try:
-        ro = sqlite3.connect(uri, uri=True)
-        ro.row_factory = sqlite3.Row
-        try:
-            rows = ro.execute(body).fetchmany(SQL_ROW_CAP + 1)
-        finally:
-            ro.close()
+        with _scoped_connection(filters) as scoped:
+            rows = scoped.execute(body).fetchmany(SQL_ROW_CAP + 1)
     except sqlite3.Error as exc:
-        return {"error": f"sqlite_{type(exc).__name__}: {exc}", "_rejected": False}
+        rejected = "not authorized" in str(exc).lower() or "no such table" in str(exc).lower()
+        return {"error": f"sqlite_{type(exc).__name__}: {exc}", "_rejected": rejected}
 
     truncated = len(rows) > SQL_ROW_CAP
     data = [dict(r) for r in rows[:SQL_ROW_CAP]]
@@ -293,24 +404,6 @@ def _date_to_epoch(date_str: str | None, *, end: bool = False) -> int | None:
         return None
 
 
-def _simulated_session_ids(session_ids: list[str], want_sim: int) -> set[str]:
-    """Which of these session_ids have is_simulated == want_sim (0/1)."""
-    if not session_ids:
-        return set()
-    out: set[str] = set()
-    try:
-        with storage.connect() as conn:
-            placeholders = ",".join(["?"] * len(session_ids))
-            rows = conn.execute(
-                f"SELECT id FROM customer_sessions WHERE id IN ({placeholders}) AND is_simulated = ?",
-                (*session_ids, want_sim),
-            ).fetchall()
-        out = {str(r["id"]) for r in rows}
-    except sqlite3.Error:
-        pass
-    return out
-
-
 def _tool_vector_search(
     query: str,
     limit: int = 5,
@@ -320,6 +413,7 @@ def _tool_vector_search(
     date_from: str | None = None,
     date_to: str | None = None,
     simulated: str = "all",
+    topic: str | None = None,
 ) -> dict[str, Any]:
     """Semantic search over session_memories. Always returns a dict, never raises.
 
@@ -329,8 +423,19 @@ def _tool_vector_search(
     """
     if not (query or "").strip():
         return {"error": "empty query", "_rejected": True}
-    want_sim = None if simulated in (None, "", "all") else (1 if simulated == "sim" else 0)
-    fetch_limit = min(max(limit, 1) * 3, 20) if want_sim is not None else (limit or 5)
+    scope = {
+        "employee_id": employee_id,
+        "customer_id": customer_id,
+        "location_id": location_id,
+        "date_from": date_from,
+        "date_to": date_to,
+        "simulated": simulated,
+        "topic": topic,
+    }
+    allowed_ids = _scoped_session_ids(scope)
+    # Topic/simulation filters are not Milvus fields. Fetch the maximum small-MVP
+    # result window, then intersect with SQLite's authoritative scoped ids.
+    fetch_limit = 20 if allowed_ids is not None else (limit or 5)
     try:
         from session_memory_service import get_memory_service
 
@@ -346,11 +451,9 @@ def _tool_vector_search(
     except Exception as exc:
         return {"error": f"vector_search_failed: {type(exc).__name__}: {exc}", "_rejected": False}
 
-    if want_sim is not None and hits:
-        keep = _simulated_session_ids(
-            [h.get("session_id") for h in hits if h.get("session_id")], want_sim
-        )
-        hits = [h for h in hits if h.get("session_id") in keep][: max(limit, 1)]
+    if allowed_ids is not None:
+        hits = [h for h in hits if h.get("session_id") in allowed_ids]
+    hits = hits[: max(limit, 1)]
 
     names = _customer_names_for([h.get("customer_id") for h in hits if h.get("customer_id")])
     enriched = []
@@ -385,13 +488,15 @@ def _customer_names_for(customer_ids: list[str]) -> dict[str, str]:
 # ── tool: customer_profile + search_customers ──────────────────────────────
 
 
-def _tool_customer_profile(customer_id: str) -> dict[str, Any]:
+def _tool_customer_profile(
+    customer_id: str, filters: dict[str, Any] | None = None
+) -> dict[str, Any]:
     """Full profile for one customer across all their ended sessions."""
     cid = (customer_id or "").strip()
     if not cid:
         return {"error": "empty customer_id", "_rejected": True}
     try:
-        with storage.connect() as conn:
+        with _scoped_connection(filters) as conn:
             cust = conn.execute(
                 "SELECT id, name, memory_card, preferences_json FROM customers WHERE id = ?", (cid,)
             ).fetchone()
@@ -453,14 +558,16 @@ def _tool_customer_profile(customer_id: str) -> dict[str, Any]:
         return {"error": f"sqlite_{type(exc).__name__}: {exc}", "_rejected": False}
 
 
-def _tool_search_customers(query: str, limit: int = 10) -> dict[str, Any]:
+def _tool_search_customers(
+    query: str, limit: int = 10, filters: dict[str, Any] | None = None
+) -> dict[str, Any]:
     """Find customers by name OR by topic discussed in their sessions."""
     q = (query or "").strip()
     if not q:
         return {"error": "empty query", "_rejected": True}
     like = f"%{q.lower()}%"
     try:
-        with storage.connect() as conn:
+        with _scoped_connection(filters) as conn:
             rows = conn.execute(
                 "SELECT c.id id, c.name name, COUNT(s.id) n "
                 "FROM customers c "
@@ -510,7 +617,9 @@ def _compare_entity(conn, entity_type: str, eid: str) -> dict[str, Any]:
     }
 
 
-def _tool_compare(entity_type: str, a: str, b: str) -> dict[str, Any]:
+def _tool_compare(
+    entity_type: str, a: str, b: str, filters: dict[str, Any] | None = None
+) -> dict[str, Any]:
     """Side-by-side stats for two employees OR two locations."""
     et = (entity_type or "").strip().lower()
     if et not in ("employee", "location"):
@@ -518,7 +627,7 @@ def _tool_compare(entity_type: str, a: str, b: str) -> dict[str, Any]:
     if not a or not b:
         return {"error": "provide two ids (a and b)", "_rejected": True}
     try:
-        with storage.connect() as conn:
+        with _scoped_connection(filters) as conn:
             return {
                 "entity_type": et,
                 "a": _compare_entity(conn, et, a),
@@ -528,12 +637,14 @@ def _tool_compare(entity_type: str, a: str, b: str) -> dict[str, Any]:
         return {"error": f"sqlite_{type(exc).__name__}: {exc}", "_rejected": False}
 
 
-def _tool_find_outliers(kind: str) -> dict[str, Any]:
+def _tool_find_outliers(
+    kind: str, filters: dict[str, Any] | None = None
+) -> dict[str, Any]:
     """Surface anomalies: unusually long sessions, employees far from mean
     conversion, topics with abnormally long discussions."""
     k = (kind or "duration").strip().lower()
     try:
-        with storage.connect() as conn:
+        with _scoped_connection(filters) as conn:
             if k == "conversion":
                 rows = conn.execute(
                     "WITH per AS ("
@@ -582,11 +693,17 @@ def _dispatch(name: str, args: dict[str, Any], ui_filters: dict[str, Any] | None
         v = ui.get(key)
         return v if v not in (None, "", "all") else args.get(key)
 
+    def scoped(result: dict[str, Any]) -> dict[str, Any]:
+        allowed = _scoped_session_ids(ui)
+        if allowed == set():
+            result["scope_empty"] = True
+        return result
+
     try:
         if name == "run_sql":
-            return _tool_run_sql(str(args.get("sql", "")))
+            return scoped(_tool_run_sql(str(args.get("sql", "")), filters=ui))
         if name == "vector_search":
-            return _tool_vector_search(
+            return scoped(_tool_vector_search(
                 query=str(args.get("query", "")),
                 limit=int(args.get("limit", 5) or 5),
                 employee_id=pick("employee_id"),
@@ -595,15 +712,21 @@ def _dispatch(name: str, args: dict[str, Any], ui_filters: dict[str, Any] | None
                 date_from=pick("date_from"),
                 date_to=pick("date_to"),
                 simulated=ui.get("simulated", "all"),
-            )
+                topic=pick("topic"),
+            ))
         if name == "customer_profile":
-            return _tool_customer_profile(str(args.get("customer_id", "")))
+            return scoped(_tool_customer_profile(str(args.get("customer_id", "")), filters=ui))
         if name == "search_customers":
-            return _tool_search_customers(str(args.get("query", "")), int(args.get("limit", 10) or 10))
+            return scoped(_tool_search_customers(
+                str(args.get("query", "")), int(args.get("limit", 10) or 10), filters=ui
+            ))
         if name == "compare":
-            return _tool_compare(str(args.get("entity_type", "")), str(args.get("a", "")), str(args.get("b", "")))
+            return scoped(_tool_compare(
+                str(args.get("entity_type", "")), str(args.get("a", "")),
+                str(args.get("b", "")), filters=ui,
+            ))
         if name == "find_outliers":
-            return _tool_find_outliers(str(args.get("kind", "duration")))
+            return scoped(_tool_find_outliers(str(args.get("kind", "duration")), filters=ui))
         return {"error": f"unknown tool: {name}", "_rejected": True}
     except Exception as exc:  # never let a tool crash break the loop
         return {"error": f"dispatch_{type(exc).__name__}: {exc}", "_rejected": False}
@@ -630,7 +753,8 @@ def answer_question(
     client = _openai_client()
     if client is None:
         return _finalize(
-            "Q&A agent is not configured (missing OPENAI_API_KEY). Set it and restart the server.",
+            "Q&A agent is not configured (missing SHIFTMIND_LLM_API_KEY or OPENAI_API_KEY). "
+            "Set one and restart the server.",
             _empty_trace(),
             0,
             started,
@@ -1075,7 +1199,13 @@ def _stats_summary(stats: dict[str, Any]) -> str:
 
 
 def _template_suggestions(stats: dict[str, Any]) -> list[str]:
-    out = ["What is the overall conversion rate?"]
+    # These remain useful on a brand-new database and are also the deterministic
+    # fallback when creative generation is unavailable.
+    out = [
+        "What is the overall conversion rate?",
+        "What are the most common conversation topics?",
+        "Which customer conversations lasted the longest?",
+    ]
     topics = stats.get("top_topics") or []
     if topics:
         out.append(f"Why is {topics[0]['topic']} the most common topic?")

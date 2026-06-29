@@ -22,8 +22,14 @@ def tmp_db(tmp_path: Path, monkeypatch) -> Path:
     conn = sqlite3.connect(db)
     conn.executescript(
         """
-        CREATE TABLE customer_sessions (id TEXT, customer_id TEXT, outcome TEXT, duration_seconds REAL);
+        CREATE TABLE customer_sessions (
+            id TEXT, customer_id TEXT, employee_id TEXT, location_id TEXT,
+            topics_json TEXT DEFAULT '[]', started_at TEXT, is_simulated INTEGER DEFAULT 0,
+            outcome TEXT, duration_seconds REAL
+        );
         CREATE TABLE customers (id TEXT, name TEXT);
+        CREATE TABLE employees (id TEXT, name TEXT);
+        CREATE TABLE locations (id TEXT, name TEXT);
         """
     )
     conn.executemany(
@@ -91,3 +97,19 @@ def test_bad_sql_returns_error_not_raise(tmp_db):
     assert "error" in res
     # Execution error (not a guard rejection) but still safe.
     assert res.get("_rejected") is False
+
+
+def test_unsupported_table_is_rejected(tmp_db):
+    res = _tool_run_sql("SELECT * FROM sqlite_master")
+    assert res.get("_rejected") is True
+
+
+def test_filters_limit_free_form_sql(tmp_db):
+    with sqlite3.connect(tmp_db) as conn:
+        conn.execute("UPDATE customer_sessions SET employee_id='emp-a', is_simulated=0 WHERE id='session-001'")
+        conn.execute("UPDATE customer_sessions SET employee_id='emp-b', is_simulated=1 WHERE id='session-002'")
+    res = _tool_run_sql(
+        "SELECT id FROM customer_sessions ORDER BY id",
+        filters={"employee_id": "emp-a", "simulated": "real"},
+    )
+    assert [row["id"] for row in res["rows"]] == ["session-001"]

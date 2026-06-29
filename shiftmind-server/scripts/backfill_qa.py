@@ -27,7 +27,7 @@ from dotenv import load_dotenv
 
 load_dotenv()
 
-from session_memory_service import get_memory_service  # noqa: E402
+from session_memory_service import _embedding_client, get_memory_service  # noqa: E402
 from session_service import _openai_client, _summarize_session  # noqa: E402
 from storage import _duration_seconds, storage  # noqa: E402
 
@@ -68,8 +68,8 @@ def reindex_memories(*, limit: int | None = None, dry_run: bool = False) -> dict
     session_memories collection back in sync with SQLite. Does NOT touch SQL
     columns. Re-embeds unconditionally (ignores has_session).
     """
-    if _openai_client() is None:
-        print("[reindex] OPENAI_API_KEY not set — cannot embed.")
+    if _embedding_client() is None:
+        print("[reindex] SHIFTMIND_EMBED_API_KEY (or shared fallback) not set — cannot embed.")
         return {"embedded": 0, "errors": 0, "dry_run": dry_run, "no_key": True}
 
     sessions = _all_ended_sessions(limit)

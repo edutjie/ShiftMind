@@ -112,4 +112,6 @@ dependencies {
 
     // ML Kit: on-device lightweight face detection for cursor gating.
     implementation(libs.mlkit.face.detection)
+
+    testImplementation(kotlin("test"))
 }

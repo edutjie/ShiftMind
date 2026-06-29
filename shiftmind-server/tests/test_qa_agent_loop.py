@@ -59,7 +59,7 @@ def test_loop_dispatches_both_tools_then_stops(monkeypatch):
         seen.append(("vector_search", query))
         return {"hits": [{"session_id": "session-a", "customer_id": "person-001"}], "rowcount": 1, "_session_ids": ["session-a"]}
 
-    def fake_sql(sql):
+    def fake_sql(sql, **_):
         seen.append(("run_sql", sql))
         return {"rows": [{"n": 5}], "rowcount": 1, "truncated": False, "_session_ids": []}
 
@@ -98,7 +98,7 @@ def test_loop_terminates_immediately_on_stop(monkeypatch):
 
 
 def test_loop_hits_max_iterations(monkeypatch):
-    monkeypatch.setattr(qa_service, "_tool_run_sql", lambda sql: {"rows": [], "rowcount": 0, "_session_ids": []})
+    monkeypatch.setattr(qa_service, "_tool_run_sql", lambda sql, **_: {"rows": [], "rowcount": 0, "_session_ids": []})
     # Model never stops — always emits another tool call.
     script = [_msg(tool_calls=[_tc(f"c{i}", "run_sql", '{"sql":"SELECT 1"}')]) for i in range(qa_service.MAX_ITERATIONS + 3)]
     _install_client(monkeypatch, script)
@@ -111,7 +111,7 @@ def test_loop_hits_max_iterations(monkeypatch):
 
 def test_loop_bad_tool_args_do_not_crash(monkeypatch):
     # Arguments aren't valid JSON for the args we need -> dispatch handles gracefully.
-    monkeypatch.setattr(qa_service, "_tool_run_sql", lambda sql: {"error": f"bad sql: {sql}", "_rejected": False, "_session_ids": []})
+    monkeypatch.setattr(qa_service, "_tool_run_sql", lambda sql, **_: {"error": f"bad sql: {sql}", "_rejected": False, "_session_ids": []})
     script = [
         _msg(tool_calls=[_tc("c1", "run_sql", '{"sql":"SELECT broken"}')]),
         _msg(content="Recovered after an error."),

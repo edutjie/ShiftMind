@@ -247,7 +247,7 @@ def _active_from_row(row: dict[str, Any]) -> ActiveSession:
 
 
 def _openai_client() -> Any | None:
-    api_key = os.getenv("OPENAI_API_KEY") or os.getenv("SHIFTMIND_LLM_API_KEY")
+    api_key = os.getenv("SHIFTMIND_LLM_API_KEY") or os.getenv("OPENAI_API_KEY")
     if not api_key:
         return None
     try:
@@ -255,7 +255,7 @@ def _openai_client() -> Any | None:
     except Exception:
         return None
     kwargs: dict[str, Any] = {"api_key": api_key}
-    base_url = os.getenv("OPENAI_BASE_URL") or os.getenv("SHIFTMIND_LLM_BASE_URL")
+    base_url = os.getenv("SHIFTMIND_LLM_BASE_URL") or os.getenv("OPENAI_BASE_URL")
     if base_url:
         kwargs["base_url"] = base_url
     return OpenAI(**kwargs)

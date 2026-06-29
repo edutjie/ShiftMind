@@ -52,21 +52,25 @@ Session finish works without credentials, but only stores a fallback "no transcr
 summary. Add these for OpenAI-compatible summary/fallback transcription:
 
 ```bash
-OPENAI_API_KEY=...
-OPENAI_BASE_URL=...              # optional OpenAI-compatible base URL
+SHIFTMIND_LLM_API_KEY=...
+SHIFTMIND_LLM_BASE_URL=...       # optional OpenAI-compatible base URL
 SHIFTMIND_TRANSCRIBE_MODEL=whisper-large-v3-turbo
 SHIFTMIND_LLM_MODEL="gpt-5.4-mini"
 ```
 
-The Q&A agent reuses the same OpenAI-compatible client for chat + text
-embeddings. Embeddings land in a second Milvus Lite collection
+`OPENAI_API_KEY` / `OPENAI_BASE_URL` remain backward-compatible fallbacks.
+
+The Q&A agent uses the LLM client above. Text embeddings can use a separate
+OpenAI-compatible provider and land in a second Milvus Lite collection
 (`session_memories`); the dim is fixed at collection creation, so set these
 before the first run (and don't change them afterward without dropping the
 collection):
 
 ```bash
+SHIFTMIND_EMBED_API_KEY=...
+SHIFTMIND_EMBED_BASE_URL=...                    # optional; falls back to shared/LLM URL
 SHIFTMIND_EMBED_MODEL=text-embedding-3-small   # any OpenAI-compatible embeddings model
-SHIFTMIND_EMBED_DIM=1536                        # must match the model's output dim
+SHIFTMIND_EMBED_DIM=1536                       # must match the model's output dim
 ```
 
 ## Endpoints
