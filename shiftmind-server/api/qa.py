@@ -8,7 +8,7 @@ from __future__ import annotations
 
 import asyncio
 
-from fastapi import APIRouter, HTTPException
+from fastapi import APIRouter, File, HTTPException, UploadFile
 from fastapi.responses import HTMLResponse
 from pydantic import BaseModel
 
@@ -71,6 +71,39 @@ async def ask(payload: AskPayload) -> dict:
         filters=filters,
         history=history,
     )
+
+
+@router.post("/api/qa/ask-audio")
+async def ask_audio(
+    audio: UploadFile = File(...),
+    location_id: str | None = None,
+    employee_id: str | None = None,
+    topic: str | None = None,
+    date_from: str | None = None,
+    date_to: str | None = None,
+    simulated: str = "all",
+) -> dict:
+    """Glasses-side Q&A: accept a spoken WAV, transcribe, then run the agent.
+
+    Returns the same shape as /api/qa/ask plus `question` (the transcribed text)
+    and `transcribe_status`. Glasses render `short_answer` (≤140 chars); the full
+    `answer` is logged server-side and surfaced via /api/qa/last-glasses.
+    """
+    audio_bytes = await audio.read()
+    login = active_login.read()
+    filters = _filters_from_query(location_id, employee_id, topic, date_from, date_to, simulated)
+    return await asyncio.to_thread(
+        qa_service.answer_question_from_audio,
+        audio_bytes,
+        employee_id=login.employee_id if login else None,
+        filters=filters,
+    )
+
+
+@router.get("/api/qa/last-glasses")
+async def last_glasses(limit: int = 20) -> dict:
+    """Recent glasses Q&A turns (newest first) for the dashboard panel."""
+    return {"items": await asyncio.to_thread(qa_service.recent_glasses_qa, limit)}
 
 
 @router.get("/api/qa/suggestions")
@@ -145,6 +178,9 @@ button:disabled{opacity:.5;cursor:wait}
 .fchip{background:#034;border:0;color:#9f9;padding:2px 6px;border-radius:8px;font-size:10px}
 .fchip b{color:#efe}
 .panel{border:1px solid #0f0;padding:12px;margin-top:14px;border-radius:3px}
+.gq{border-top:1px dashed #044;padding:8px 0}
+.gq:first-child{border-top:0}
+.gq-q{color:#9f9;font-weight:bold;margin-bottom:4px;word-break:break-word}
 .answer{color:#efe;line-height:1.55}
 .answer p{margin:.3em 0}
 .answer h4,.answer h5,.answer h6{margin:.5em 0 .2em;color:#9f9}
@@ -197,6 +233,11 @@ semantic memory, then answers with sources.</p>
 </div>
 <div class="chips" id="chips"></div>
 <div id="result"></div>
+<div class="panel" id="glasses-panel">
+  <h3>recent glasses questions</h3>
+  <p class="muted">spoken on the glasses &rarr; full answer here. auto-refreshes every 4s.</p>
+  <div id="glasses-log"><p class="muted">none yet</p></div>
+</div>
 <p class="muted"><a href="/api/preview.html">preview</a> · <a href="/api/faces.html">faces debug</a></p>
 
 <script>
@@ -229,6 +270,29 @@ async function loadChips(creative){
   }catch(e){ /* keep last render */ }
 }
 loadChips(false);
+
+// ── glasses Q&A log (spoken questions → full answers) ──
+async function loadGlassesLog(){
+  try{
+    const r = await fetch("/api/qa/last-glasses?limit=15");
+    const d = await r.json();
+    const box = document.getElementById("glasses-log");
+    const items = d.items || [];
+    if(!items.length){ box.innerHTML = '<p class="muted">none yet</p>'; return; }
+    box.innerHTML = items.map(it => {
+      const ans = (it.answer || "").split("\n").map(p => '<p>'+esc(p)+'</p>').join("");
+      const meta = esc(it.ts || '') + (it.employee_id ? ' · '+esc(it.employee_id) : '')
+        + (it.elapsed_ms!=null ? ' · '+it.elapsed_ms+'ms' : '');
+      return '<div class="gq">'
+        + '<div class="gq-q">'+esc(it.question || '(empty)')+'</div>'
+        + '<div class="answer">'+(ans || '<p class="muted">(no answer)</p>')+'</div>'
+        + '<div class="muted">'+meta+'</div>'
+        + '</div>';
+    }).join("");
+  }catch(e){ /* keep last render */ }
+}
+loadGlassesLog();
+setInterval(loadGlassesLog, 4000);
 
 // ── filters ──
 const fLoc = document.getElementById("f-loc");

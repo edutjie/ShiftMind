@@ -15,7 +15,10 @@ session_memory_service client for embeddings/vector search.
 """
 from __future__ import annotations
 
+import collections
+import datetime
 import json
+import logging
 import os
 import re
 import sqlite3
@@ -30,6 +33,13 @@ MAX_ITERATIONS = 6
 TOOL_RESULT_MAX_CHARS = 4000
 SQL_ROW_CAP = 50
 _QA_TABLES = {"customer_sessions", "customers", "employees", "locations", "json_each"}
+
+logger = logging.getLogger("shiftmind.qa")
+
+# In-memory ring buffer of recent glasses-side Q&A turns, surfaced via
+# GET /api/qa/last-glasses and the /api/qa.html "recent glasses questions"
+# panel. Lost on restart — acceptable for a developer-facing display.
+_GLASSES_QA_LOG: collections.deque = collections.deque(maxlen=50)
 
 # Keywords that have no business in a read-only SELECT. Belt-and-suspenders
 # on top of the driver-level mode=ro connection.
@@ -827,6 +837,78 @@ def answer_question(
         fallback, collected, MAX_ITERATIONS, started,
         configured=True, question=question, short_answer=short,
     )
+
+
+def answer_question_from_audio(
+    audio_bytes: bytes,
+    *,
+    employee_id: str | None = None,
+    filters: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    """Glasses-side Q&A entry: transcribe a spoken WAV, then answer_question.
+
+    Returns the answer_question result augmented with `question` (the transcribed
+    text, so the glasses can echo what it heard) and `transcribe_status`. The
+    full `answer` is logged server-side via _log_glasses_qa; the glasses render
+    only `short_answer`.
+    """
+    from session_service import _transcribe_audio
+
+    question, transcribe_status = _transcribe_audio(audio_bytes)
+    question = (question or "").strip()
+    if not question:
+        if transcribe_status == "missing_openai_config":
+            return {
+                "answer": "Voice transcription is not configured (missing SHIFTMIND_LLM_API_KEY or OPENAI_API_KEY). Set one and restart the server.",
+                "short_answer": "transcription not configured",
+                "trace": [], "sources": [], "iterations": 0, "elapsed_ms": 0,
+                "configured": False, "question": "", "transcribe_status": transcribe_status,
+            }
+        short = (
+            "(no speech heard)"
+            if transcribe_status == "transcribed"
+            else f"(transcribe failed: {transcribe_status})"
+        )
+        return {
+            "answer": "", "short_answer": short,
+            "trace": [], "sources": [], "iterations": 0, "elapsed_ms": 0,
+            "configured": True, "question": "", "transcribe_status": transcribe_status,
+        }
+
+    result = answer_question(question, employee_id=employee_id, filters=filters)
+    result["question"] = question
+    result["transcribe_status"] = transcribe_status
+    _log_glasses_qa(question, result, employee_id)
+    return result
+
+
+def _log_glasses_qa(
+    question: str, result: dict[str, Any], employee_id: str | None
+) -> None:
+    """Server-side full-answer channel: uvicorn console log + in-memory ring."""
+    answer = result.get("answer", "")
+    short = result.get("short_answer", "")
+    logger.info(
+        "[glasses-qa] employee=%s | Q: %s | A: %s | short: %s",
+        employee_id, question, answer, short,
+    )
+    _GLASSES_QA_LOG.append({
+        "ts": datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+        "employee_id": employee_id,
+        "question": question,
+        "answer": answer,
+        "short_answer": short,
+        "elapsed_ms": result.get("elapsed_ms"),
+        "iterations": result.get("iterations"),
+    })
+
+
+def recent_glasses_qa(limit: int = 20) -> list[dict[str, Any]]:
+    """Newest-first snapshot of recent glasses Q&A turns (in-memory only)."""
+    items = list(_GLASSES_QA_LOG)
+    if limit and limit > 0:
+        items = items[-limit:]
+    return list(reversed(items))
 
 
 def _empty_trace() -> dict[str, Any]:

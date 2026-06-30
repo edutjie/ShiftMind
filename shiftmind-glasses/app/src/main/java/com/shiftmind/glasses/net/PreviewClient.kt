@@ -4,6 +4,7 @@ import android.util.Log
 import com.shiftmind.glasses.BuildConfig
 import com.shiftmind.glasses.hud.CustomerCard
 import com.shiftmind.glasses.hud.HudStateHolder
+import com.shiftmind.glasses.qa.QAModeHolder
 import com.shiftmind.glasses.session.CustomerSessionHolder
 import com.shiftmind.glasses.session.CustomerSessionState
 import okhttp3.MediaType.Companion.toMediaType
@@ -86,6 +87,11 @@ class PreviewClient(private val baseUrl: String = BuildConfig.SERVER_URL) {
 
     private fun applyRecognitionResponse(body: String) {
         val root = runCatching { JSONObject(body) }.getOrNull() ?: return
+        // Q&A mode: drop ALL recognition so no customer session can start and the
+        // HUD card cannot mutate while the user is asking a question. The
+        // active_employee login mirror is skipped too — invisible, since QAScreen
+        // is shown (not HudScreen), and it re-syncs on the next frame after exit.
+        if (QAModeHolder.current) return
         val activeSession = root.optJSONObject("active_session")
         activeSession?.let { applyActiveSession(it) }
         val activeEmployee = root.optJSONObject("active_employee")
