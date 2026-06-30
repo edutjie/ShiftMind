@@ -24,6 +24,7 @@ import com.shiftmind.glasses.hud.HudScreen
 import com.shiftmind.glasses.hud.HudStateHolder
 import com.shiftmind.glasses.net.HudStateClient
 import com.shiftmind.glasses.net.SessionAudioStreamClient
+import com.shiftmind.glasses.net.QaAudioStreamClient
 import com.shiftmind.glasses.net.QaClient
 import com.shiftmind.glasses.net.SessionClient
 import com.shiftmind.glasses.qa.QAModeHolder
@@ -58,8 +59,9 @@ class MainActivity : ComponentActivity() {
     private val sessionAudioStreamClient by lazy { SessionAudioStreamClient() }
     private val voiceSessionRecorder by lazy { VoiceSessionRecorder(applicationContext) }
     private val qaClient by lazy { QaClient() }
-    private val qaController by lazy { QaController(voiceSessionRecorder, qaClient) }
-    private var recKeyDownTimeMs = 0L
+    private val qaStream by lazy { QaAudioStreamClient() }
+    private val qaController by lazy { QaController(voiceSessionRecorder, qaClient, qaStream) }
+    private var lastSwipeToggleMs = 0L
 
     // External AR recorder (Rokid mix_record from OverlayRec etc.) is no longer
     // expected to be used now that ShiftMind has its own recorder — but if
@@ -225,45 +227,43 @@ class MainActivity : ComponentActivity() {
      * focus would otherwise consume them.
      */
     override fun dispatchKeyEvent(event: KeyEvent): Boolean {
-        // RECORDING_KEY (touchpad): long-press toggles Q&A mode; short-tap is the
-        // context action (AR-recording toggle outside Q&A, tap-to-talk inside).
-        // We decide on ACTION_UP from the hold duration measured at ACTION_DOWN, so
-        // the short-tap path fires on key-up with zero added latency. ACTION_DOWN
-        // (incl. auto-repeats from a long hold) is consumed so the system long-press
-        // menu can't fire.
-        if (event.keyCode == BuildConfig.RECORDING_KEY) {
-            when (event.action) {
-                KeyEvent.ACTION_DOWN -> {
-                    if (event.repeatCount == 0) recKeyDownTimeMs = SystemClock.uptimeMillis()
-                    return true
-                }
-                KeyEvent.ACTION_UP -> {
-                    val held = SystemClock.uptimeMillis() - recKeyDownTimeMs
-                    recKeyDownTimeMs = 0L
-                    val longPress = held >= QA_LONG_PRESS_MS
-                    Log.i(TAG, "rec key: held=${held}ms ${if (longPress) "(long)" else "(short)"} qa=${QAModeHolder.current}")
-                    when {
-                        longPress -> toggleQaMode()
-                        QAModeHolder.current -> qaController.onActionKey()  // record / stop+send / next
-                        else -> onRecordingButtonPressed()
-                    }
-                    return true
-                }
-            }
-        }
-
         if (event.action == KeyEvent.ACTION_DOWN && event.repeatCount == 0) {
             Log.i(TAG, "keyEvent: code=${event.keyCode} (${KeyEvent.keyCodeToString(event.keyCode)}) scan=${event.scanCode}")
-            if (event.keyCode == BuildConfig.SESSION_KEY) {
-                // Inside Q&A: consume + ignore (touchpad long-press is the exit path,
-                // and double-tap SESSION_KEY is native app-close — must not compound).
-                // Outside Q&A: stop an active customer session, else no-op toast.
-                if (QAModeHolder.current) return true
-                onSessionButtonPressed()
-                return true
+            when (event.keyCode) {
+                BuildConfig.RECORDING_KEY -> {
+                    // Touchpad single-tap: AR-recording toggle outside Q&A,
+                    // tap-to-talk (record / stop+send / next) inside Q&A.
+                    if (QAModeHolder.current) qaController.onActionKey()
+                    else onRecordingButtonPressed()
+                    return true
+                }
+                KeyEvent.KEYCODE_DPAD_DOWN -> {
+                    // Touchpad swipe-forward (back→front on the temple pad; firmware
+                    // emits DPAD_DOWN) toggles Q&A — enter when idle, exit when in.
+                    // One physical swipe can emit several DPAD_DOWN key events in quick
+                    // succession (seen 2 within ~60ms in discovery) — debounce so a
+                    // single swipe doesn't toggle on then straight back off.
+                    trySwipeToggle()
+                    return true
+                }
+                BuildConfig.SESSION_KEY -> {
+                    // Inside Q&A: ignore (swipe-down exits; double-tap SESSION_KEY is
+                    // native app-close — must not compound). Outside: stop session.
+                    if (QAModeHolder.current) return true
+                    onSessionButtonPressed()
+                    return true
+                }
             }
         }
         return super.dispatchKeyEvent(event)
+    }
+
+    /** Debounce-wrapped Q&A toggle for touchpad swipe-down. */
+    private fun trySwipeToggle() {
+        val now = SystemClock.uptimeMillis()
+        if (now - lastSwipeToggleMs < SWIPE_DEBOUNCE_MS) return
+        lastSwipeToggleMs = now
+        toggleQaMode()
     }
 
     /**
@@ -312,7 +312,7 @@ class MainActivity : ComponentActivity() {
     }
 
     /**
-     * Toggle Q&A mode (called on touchpad long-press).
+     * Toggle Q&A mode (called on touchpad swipe-down).
      *
      * Enter only when no customer session is active and no voice capture is
      * running; exit otherwise, discarding any open Q&A capture.
@@ -495,7 +495,7 @@ class MainActivity : ComponentActivity() {
     companion object {
         private const val TAG = "ShiftMind.Main"
         private const val TRANSCRIPT_HOLD_MS = 6_000L
-        private const val QA_LONG_PRESS_MS = 600L
+        private const val SWIPE_DEBOUNCE_MS = 600L
         private const val WAKE_LOCK_TIMEOUT_MS = 4L * 60L * 60L * 1000L
     }
 }

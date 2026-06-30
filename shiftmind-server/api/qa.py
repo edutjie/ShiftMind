@@ -7,12 +7,15 @@ tools and returns an answer + tool-call trace + source sessions.
 from __future__ import annotations
 
 import asyncio
+import contextlib
+import json
 
-from fastapi import APIRouter, File, HTTPException, UploadFile
+from fastapi import APIRouter, File, HTTPException, UploadFile, WebSocket, WebSocketDisconnect
 from fastapi.responses import HTMLResponse
 from pydantic import BaseModel
 
 from auth import active_login
+from doubao_asr import DoubaoSeedAsrStream
 import qa_service
 
 router = APIRouter()
@@ -104,6 +107,79 @@ async def ask_audio(
 async def last_glasses(limit: int = 20) -> dict:
     """Recent glasses Q&A turns (newest first) for the dashboard panel."""
     return {"items": await asyncio.to_thread(qa_service.recent_glasses_qa, limit)}
+
+
+@router.websocket("/api/qa/audio-stream")
+async def qa_audio_stream(websocket: WebSocket) -> None:
+    """Glasses-side Q&A live ASR stream.
+
+    Same wire shape as /api/session/{id}/audio-stream but decoupled from any
+    customer session: relays 16kHz mono PCM to Doubao Seed ASR and streams back
+    partial/final transcripts so the glasses can show the spoken question live.
+    On ``eof`` it flushes Doubao for the final text. No DB writes — the gathered
+    question is then POSTed to /api/qa/ask by the glasses.
+    """
+    await websocket.accept()
+    asr = DoubaoSeedAsrStream()
+    if not asr.configured:
+        await websocket.send_text(json.dumps({"type": "asr_status", "status": "missing_doubao_env"}))
+        await _qa_drain(websocket)
+        return
+    try:
+        async with asr:
+            await websocket.send_text(json.dumps({"type": "asr_status", "status": "connected"}))
+            recv_task = asyncio.create_task(_qa_recv_loop(websocket, asr))
+            try:
+                while True:
+                    message = await websocket.receive()
+                    if message.get("bytes") is not None:
+                        await asr.send_audio(message["bytes"])
+                    elif message.get("text") == "eof":
+                        await asr.send_audio(b"", final=True)
+                        await asyncio.sleep(2.0)  # let Doubao flush final transcripts
+                        break
+            except WebSocketDisconnect:
+                with contextlib.suppress(Exception):
+                    await asr.send_audio(b"", final=True)
+            finally:
+                recv_task.cancel()
+                with contextlib.suppress(Exception):
+                    await recv_task
+    except Exception as exc:
+        await websocket.send_text(json.dumps({"type": "asr_status", "status": f"error:{type(exc).__name__}"}))
+
+
+async def _qa_recv_loop(websocket: WebSocket, asr: DoubaoSeedAsrStream) -> None:
+    final_parts: list[str] = []
+    partial = ""
+    while True:
+        item = await asr.recv_text()
+        if not item:
+            continue
+        text, final = item
+        if final:
+            final_parts.append(text)
+            partial = ""
+        else:
+            partial = text
+        final_text = " ".join(p for p in final_parts if p.strip()).strip()
+        await websocket.send_text(json.dumps({
+            "type": "transcript",
+            "text": text,
+            "final": final,
+            "final_text": final_text,
+            "partial_text": partial,
+        }, ensure_ascii=False))
+
+
+async def _qa_drain(websocket: WebSocket) -> None:
+    try:
+        while True:
+            message = await websocket.receive()
+            if message.get("text") == "eof":
+                break
+    except WebSocketDisconnect:
+        return
 
 
 @router.get("/api/qa/suggestions")

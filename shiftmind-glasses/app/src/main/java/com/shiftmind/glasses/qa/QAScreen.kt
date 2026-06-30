@@ -24,12 +24,12 @@ private val Muted = Color.White.copy(alpha = 0.65f)
 private val Red = Color(0xFFFF6060)
 
 /**
- * Q&A HUD screen — entered by double-tapping SESSION_KEY when no customer is
- * scanned. Mirrors [com.shiftmind.glasses.hud.HudScreen]'s visual language
- * (black bg, green monospace) so it reads as the same surface on the prism.
+ * Q&A HUD screen — entered by a touchpad swipe-forward (back→front) when no
+ * customer is scanned. Mirrors [com.shiftmind.glasses.hud.HudScreen]'s visual
+ * language (black bg, green monospace) so it reads as the same surface on prism.
  *
- * Input is keys + voice only (touch precision on the Rokid touchpad is
- * unverified): suggestions are recommendations to SPEAK aloud, not tap targets.
+ * Input is keys + voice only: tap the touchpad to record, speak, tap again to
+ * send. The live transcript of the question is shown while recording.
  */
 @Composable
 fun QAScreen(controller: QaController) {
@@ -56,8 +56,10 @@ fun QAScreen(controller: QaController) {
             Spacer(Modifier.height(10.dp))
 
             when (val s = state) {
-                is QaUiState.Loading -> {
-                    Text("loading suggestions…", color = Muted, fontSize = 12.sp)
+                is QaUiState.Idle -> {
+                    Text("tap ● to ask", color = Green, fontSize = 16.sp, fontWeight = FontWeight.Bold)
+                    Spacer(Modifier.height(4.dp))
+                    Text("speak your question", color = Muted, fontSize = 11.sp)
                 }
 
                 is QaUiState.Thinking -> {
@@ -65,28 +67,21 @@ fun QAScreen(controller: QaController) {
                 }
 
                 is QaUiState.Recording -> {
-                    Text("● Listening…", color = Green, fontSize = 18.sp, fontWeight = FontWeight.Bold)
-                    Spacer(Modifier.height(4.dp))
-                    Text("tap ● (rec key) to ask", color = Muted, fontSize = 11.sp)
-                }
-
-                is QaUiState.Suggestions -> {
-                    Text("speak any question (tap ● to record):", color = Muted, fontSize = 11.sp)
+                    Text("● Listening…", color = Green, fontSize = 16.sp, fontWeight = FontWeight.Bold)
                     Spacer(Modifier.height(8.dp))
-                    if (s.items.isEmpty()) {
-                        Text("(no suggestions — just ask)", color = Muted, fontSize = 11.sp)
+                    if (s.partial.isNotBlank()) {
+                        Text(
+                            text = s.partial,
+                            color = Green.copy(alpha = 0.9f),
+                            fontSize = 13.sp,
+                            lineHeight = 16.sp,
+                            maxLines = 5,
+                        )
                     } else {
-                        s.items.take(5).forEachIndexed { idx, q ->
-                            Text(
-                                text = "${idx + 1}. $q",
-                                color = Green.copy(alpha = 0.85f),
-                                fontSize = 11.sp,
-                                lineHeight = 14.sp,
-                                maxLines = 2,
-                            )
-                            Spacer(Modifier.height(3.dp))
-                        }
+                        Text("(listening…)", color = Muted, fontSize = 11.sp)
                     }
+                    Spacer(Modifier.height(6.dp))
+                    Text("tap ● to ask", color = Muted, fontSize = 11.sp)
                 }
 
                 is QaUiState.Answer -> {
@@ -112,7 +107,7 @@ fun QAScreen(controller: QaController) {
             }
         }
 
-        // Footer hint — pinned to bottom.
+        // Footer hint — pinned to bottom. Swipe-forward = exit.
         Box(
             modifier = Modifier
                 .fillMaxSize()
@@ -125,7 +120,7 @@ fun QAScreen(controller: QaController) {
                 horizontalAlignment = Alignment.CenterHorizontally,
             ) {
                 Text(
-                    text = "● rec = record/ask     ●● session = exit",
+                    text = "● rec = record/ask     → swipe = exit",
                     color = Green.copy(alpha = 0.55f),
                     fontSize = 10.sp,
                 )
