@@ -59,7 +59,7 @@ class MainActivity : ComponentActivity() {
     private val voiceSessionRecorder by lazy { VoiceSessionRecorder(applicationContext) }
     private val qaClient by lazy { QaClient() }
     private val qaController by lazy { QaController(voiceSessionRecorder, qaClient) }
-    private var lastSessionTapMs = 0L
+    private var recKeyDownTimeMs = 0L
 
     // External AR recorder (Rokid mix_record from OverlayRec etc.) is no longer
     // expected to be used now that ShiftMind has its own recorder — but if
@@ -225,25 +225,42 @@ class MainActivity : ComponentActivity() {
      * focus would otherwise consume them.
      */
     override fun dispatchKeyEvent(event: KeyEvent): Boolean {
-        if (event.action == KeyEvent.ACTION_DOWN && event.repeatCount == 0) {
-            Log.i(TAG, "keyEvent: code=${event.keyCode} (${KeyEvent.keyCodeToString(event.keyCode)}) scan=${event.scanCode}")
-            val qa = QAModeHolder.current
-            when (event.keyCode) {
-                BuildConfig.RECORDING_KEY -> {
-                    // Inside Q&A this is the action key (record / stop+send / next);
-                    // outside Q&A it toggles AR recording as before.
-                    if (qa) qaController.onActionKey() else onRecordingButtonPressed()
-                    return true   // consume — don't let system also process this key
-                }
-                BuildConfig.SESSION_KEY -> {
-                    // Double-tap toggles Q&A: enter when idle (no customer scanned),
-                    // exit when already inside. A single tap is a no-op + hint, so no
-                    // latency is added to the existing session-stop path.
-                    if (qa) handleQaDoubleTap()
-                    else if (CustomerSessionHolder.current != null || voiceSessionRecorder.isRecording) onSessionButtonPressed()
-                    else handleQaDoubleTap()
+        // RECORDING_KEY (touchpad): long-press toggles Q&A mode; short-tap is the
+        // context action (AR-recording toggle outside Q&A, tap-to-talk inside).
+        // We decide on ACTION_UP from the hold duration measured at ACTION_DOWN, so
+        // the short-tap path fires on key-up with zero added latency. ACTION_DOWN
+        // (incl. auto-repeats from a long hold) is consumed so the system long-press
+        // menu can't fire.
+        if (event.keyCode == BuildConfig.RECORDING_KEY) {
+            when (event.action) {
+                KeyEvent.ACTION_DOWN -> {
+                    if (event.repeatCount == 0) recKeyDownTimeMs = SystemClock.uptimeMillis()
                     return true
                 }
+                KeyEvent.ACTION_UP -> {
+                    val held = SystemClock.uptimeMillis() - recKeyDownTimeMs
+                    recKeyDownTimeMs = 0L
+                    val longPress = held >= QA_LONG_PRESS_MS
+                    Log.i(TAG, "rec key: held=${held}ms ${if (longPress) "(long)" else "(short)"} qa=${QAModeHolder.current}")
+                    when {
+                        longPress -> toggleQaMode()
+                        QAModeHolder.current -> qaController.onActionKey()  // record / stop+send / next
+                        else -> onRecordingButtonPressed()
+                    }
+                    return true
+                }
+            }
+        }
+
+        if (event.action == KeyEvent.ACTION_DOWN && event.repeatCount == 0) {
+            Log.i(TAG, "keyEvent: code=${event.keyCode} (${KeyEvent.keyCodeToString(event.keyCode)}) scan=${event.scanCode}")
+            if (event.keyCode == BuildConfig.SESSION_KEY) {
+                // Inside Q&A: consume + ignore (touchpad long-press is the exit path,
+                // and double-tap SESSION_KEY is native app-close — must not compound).
+                // Outside Q&A: stop an active customer session, else no-op toast.
+                if (QAModeHolder.current) return true
+                onSessionButtonPressed()
+                return true
             }
         }
         return super.dispatchKeyEvent(event)
@@ -295,24 +312,11 @@ class MainActivity : ComponentActivity() {
     }
 
     /**
-     * Double-tap detector for toggling Q&A mode on SESSION_KEY.
+     * Toggle Q&A mode (called on touchpad long-press).
      *
-     * First tap records the time + shows a hint; the mode toggle only commits
-     * when a second tap lands within [QA_DOUBLE_TAP_MS]. No deferred action /
-     * no Handler — a single tap is a pure no-op, so existing single-tap behavior
-     * (session stop) is unaffected in latency.
+     * Enter only when no customer session is active and no voice capture is
+     * running; exit otherwise, discarding any open Q&A capture.
      */
-    private fun handleQaDoubleTap() {
-        val now = SystemClock.uptimeMillis()
-        if (now - lastSessionTapMs <= QA_DOUBLE_TAP_MS) {
-            lastSessionTapMs = 0L
-            toggleQaMode()
-        } else {
-            lastSessionTapMs = now
-            Toast.makeText(this, "tap again for Q&A", Toast.LENGTH_SHORT).show()
-        }
-    }
-
     private fun toggleQaMode() {
         if (QAModeHolder.current) {
             QAModeHolder.exit()
@@ -491,7 +495,7 @@ class MainActivity : ComponentActivity() {
     companion object {
         private const val TAG = "ShiftMind.Main"
         private const val TRANSCRIPT_HOLD_MS = 6_000L
-        private const val QA_DOUBLE_TAP_MS = 350L
+        private const val QA_LONG_PRESS_MS = 600L
         private const val WAKE_LOCK_TIMEOUT_MS = 4L * 60L * 60L * 1000L
     }
 }
