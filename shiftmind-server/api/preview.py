@@ -115,6 +115,8 @@ def _draw_hud_overlay(img: np.ndarray) -> None:
         state = {"title": "ShiftMind", "statusLine": "awaiting customer", "recordingActive": False}
     recog, _, _ = latest_recognition_state.read()
     active_session = session_service.active()
+
+    transcript_line = ""
     if active_session:
         live = session_service.live_transcript(active_session.session_id)
         transcript_line = str(live.get("partial_text") or live.get("final_text") or "").strip()
@@ -123,7 +125,7 @@ def _draw_hud_overlay(img: np.ndarray) -> None:
         state["recordingActive"] = True
         state["customerCard"] = {
             "name": active_session.name if not active_session.is_new_customer else "First visit",
-            "memoryLine": transcript_line[-140:] or active_session.memory_card or "listening",
+            "memoryLine": active_session.memory_card or "",
         }
     elif recog.get("recognition_status") in {"confirmed", "unrecognized_first_visit"}:
         state = dict(state)
@@ -221,6 +223,33 @@ def _draw_hud_overlay(img: np.ndarray) -> None:
     cv2.line(img, (cx - tick, cy), (cx + tick, cy), green, stroke, cv2.LINE_AA)
     cv2.line(img, (cx, cy - tick), (cx, cy + tick), green, stroke, cv2.LINE_AA)
 
+    # Live transcript below cursor box
+    if transcript_line:
+        transcript_y0 = y1 + int(h * 0.05)
+        transcript_w = min(w - 48, int(w * 0.74))
+        transcript_x0 = max(24, (w - transcript_w) // 2)
+        transcript_overlay = img.copy()
+        cv2.rectangle(transcript_overlay, (transcript_x0, transcript_y0), (transcript_x0 + transcript_w, transcript_y0 + int(h * 0.12)), (0, 0, 0), -1)
+        cv2.addWeighted(transcript_overlay, 0.42, img, 0.58, 0, img)
+        cv2.rectangle(img, (transcript_x0, transcript_y0), (transcript_x0 + transcript_w, transcript_y0 + int(h * 0.12)), green, 1)
+        cv2.putText(
+            img,
+            "Live Transcript",
+            (transcript_x0 + 14, transcript_y0 + int(h * 0.03)),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            _scale_for_width(w, 0.42),
+            muted,
+            1,
+            cv2.LINE_AA,
+        )
+        _fit_text(
+            img,
+            transcript_line,
+            (transcript_x0 + 14, transcript_y0 + int(h * 0.065)),
+            max_width=transcript_w - 28,
+            color=white,
+        )
+
 
 def _scale_for_width(width: int, base_at_480: float) -> float:
     return max(0.25, base_at_480 * (width / 480.0))
@@ -234,12 +263,30 @@ def _center_text(img: np.ndarray, text: str, *, y: int, scale: float, color: tup
 
 def _fit_text(img: np.ndarray, text: str, origin: tuple[int, int], *, max_width: int, color: tuple[int, int, int]) -> None:
     scale = 0.38
-    while scale > 0.24:
-        size, _ = cv2.getTextSize(text, cv2.FONT_HERSHEY_SIMPLEX, scale, 1)
+    thickness = 1
+    font = cv2.FONT_HERSHEY_SIMPLEX
+
+    words = text.split()
+    lines = []
+    current_line = ""
+
+    for word in words:
+        test_line = (current_line + " " + word).strip()
+        size, _ = cv2.getTextSize(test_line, font, scale, thickness)
         if size[0] <= max_width:
-            break
-        scale -= 0.03
-    cv2.putText(img, text, origin, cv2.FONT_HERSHEY_SIMPLEX, scale, color, 1, cv2.LINE_AA)
+            current_line = test_line
+        else:
+            if current_line:
+                lines.append(current_line)
+            current_line = word
+
+    if current_line:
+        lines.append(current_line)
+
+    x, y = origin
+    line_height = int(scale * 30)
+    for i, line in enumerate(lines[:3]):
+        cv2.putText(img, line, (x, y + i * line_height), font, scale, color, thickness, cv2.LINE_AA)
 
 
 @router.post("/api/preview-frame")
@@ -431,7 +478,7 @@ img{max-width:100%;height:auto;border:1px solid #0f0}
 .panel{width:300px;border:1px solid #0f0;padding:12px;text-align:left;box-sizing:border-box}
 .panel h4{margin:0 0 8px;color:#0f0;border-bottom:1px solid #034;padding-bottom:4px}
 .panel .label{color:#6f6;font-size:11px;margin-top:10px;text-transform:uppercase;letter-spacing:1px}
-.panel .value{color:#eee;font-size:13px;margin-top:2px;word-wrap:break-word}
+.panel .value{color:#eee;font-size:13px;margin-top:2px;word-wrap:break-word;overflow-wrap:break-word;max-width:100%}
 .panel ul{margin:4px 0 0;padding-left:18px}
 .panel li{color:#cfc;font-size:12px;margin:2px 0}
 .panel .idle{color:#666;font-style:italic}

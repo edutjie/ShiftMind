@@ -101,7 +101,7 @@ class DoubaoSeedAsrStream:
                 "model_name": self.model,
                 "enable_punc": True,
                 "enable_itn": True,
-                "enable_ddc": True,
+                "enable_ddc": False,  # Disable DDC - it may filter far-field customer speech
                 "show_utterances": True,
                 "enable_nonstream": False,
             },
