@@ -148,6 +148,7 @@ class MainActivity : ComponentActivity() {
 
         Log.i(TAG, "recording trigger key = ${BuildConfig.RECORDING_KEY} (${KeyEvent.keyCodeToString(BuildConfig.RECORDING_KEY)})")
         Log.i(TAG, "session stop key = ${BuildConfig.SESSION_KEY} (${KeyEvent.keyCodeToString(BuildConfig.SESSION_KEY)})")
+        Log.i(TAG, "Q&A toggle key = ${BuildConfig.QA_TOGGLE_KEY} (${KeyEvent.keyCodeToString(BuildConfig.QA_TOGGLE_KEY)})")
         if (BuildConfig.RECORDING_KEY == BuildConfig.SESSION_KEY) {
             Log.w(TAG, "recordingKey and sessionKey are the same; set shiftmind.sessionKey to a different physical button")
         }
@@ -231,26 +232,20 @@ class MainActivity : ComponentActivity() {
             Log.i(TAG, "keyEvent: code=${event.keyCode} (${KeyEvent.keyCodeToString(event.keyCode)}) scan=${event.scanCode}")
             when (event.keyCode) {
                 BuildConfig.RECORDING_KEY -> {
-                    // Touchpad single-tap: AR-recording toggle outside Q&A,
-                    // tap-to-talk (record / stop+send / next) inside Q&A.
-                    if (QAModeHolder.current) qaController.onActionKey()
-                    else onRecordingButtonPressed()
+                    // AR recording toggle (only outside Q&A).
+                    if (!QAModeHolder.current) onRecordingButtonPressed()
                     return true
                 }
-                KeyEvent.KEYCODE_DPAD_DOWN -> {
-                    // Touchpad swipe-forward (back→front on the temple pad; firmware
-                    // emits DPAD_DOWN) toggles Q&A — enter when idle, exit when in.
-                    // One physical swipe can emit several DPAD_DOWN key events in quick
-                    // succession (seen 2 within ~60ms in discovery) — debounce so a
-                    // single swipe doesn't toggle on then straight back off.
+                BuildConfig.QA_TOGGLE_KEY -> {
+                    // Q&A mode toggle (enter when idle, exit when active).
+                    // Debounced to avoid accidental double-toggles.
                     trySwipeToggle()
                     return true
                 }
                 BuildConfig.SESSION_KEY -> {
-                    // Inside Q&A: ignore (swipe-down exits; double-tap SESSION_KEY is
-                    // native app-close — must not compound). Outside: stop session.
-                    if (QAModeHolder.current) return true
-                    onSessionButtonPressed()
+                    // Button 23: Q&A speak action when in Q&A, stop session when outside.
+                    if (QAModeHolder.current) qaController.onActionKey()
+                    else onSessionButtonPressed()
                     return true
                 }
             }
