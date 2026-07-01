@@ -7,6 +7,7 @@ import android.content.pm.PackageManager
 import android.os.Build
 import android.os.Bundle
 import android.os.PowerManager
+import android.os.SystemClock
 import android.util.Log
 import android.view.KeyEvent
 import android.view.WindowManager
@@ -14,6 +15,8 @@ import android.widget.Toast
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.setContent
 import androidx.activity.result.contract.ActivityResultContracts
+import androidx.compose.runtime.collectAsState
+import androidx.compose.runtime.getValue
 import androidx.lifecycle.lifecycleScope
 import androidx.core.content.ContextCompat
 import com.shiftmind.glasses.camera.CameraPreviewStreamer
@@ -21,7 +24,12 @@ import com.shiftmind.glasses.hud.HudScreen
 import com.shiftmind.glasses.hud.HudStateHolder
 import com.shiftmind.glasses.net.HudStateClient
 import com.shiftmind.glasses.net.SessionAudioStreamClient
+import com.shiftmind.glasses.net.QaAudioStreamClient
+import com.shiftmind.glasses.net.QaClient
 import com.shiftmind.glasses.net.SessionClient
+import com.shiftmind.glasses.qa.QAModeHolder
+import com.shiftmind.glasses.qa.QaController
+import com.shiftmind.glasses.qa.QAScreen
 import com.shiftmind.glasses.recording.ArRecorder
 import com.shiftmind.glasses.recording.MicConfigProbe
 import com.shiftmind.glasses.recording.RecordingStateReceiver
@@ -50,6 +58,10 @@ class MainActivity : ComponentActivity() {
     private val sessionClient by lazy { SessionClient() }
     private val sessionAudioStreamClient by lazy { SessionAudioStreamClient() }
     private val voiceSessionRecorder by lazy { VoiceSessionRecorder(applicationContext) }
+    private val qaClient by lazy { QaClient() }
+    private val qaStream by lazy { QaAudioStreamClient() }
+    private val qaController by lazy { QaController(voiceSessionRecorder, qaClient, qaStream) }
+    private var lastSwipeToggleMs = 0L
 
     // External AR recorder (Rokid mix_record from OverlayRec etc.) is no longer
     // expected to be used now that ShiftMind has its own recorder — but if
@@ -117,7 +129,11 @@ class MainActivity : ComponentActivity() {
 
         setContent {
             GlassHudTheme {
-                HudScreen()
+                // Q&A screen takes over only while QAModeHolder is on AND no
+                // customer session is active. Otherwise the normal scan HUD runs.
+                val qaActive by QAModeHolder.stateFlow.collectAsState()
+                val session by CustomerSessionHolder.stateFlow.collectAsState()
+                if (qaActive && session == null) QAScreen(qaController) else HudScreen()
             }
         }
 
@@ -125,12 +141,14 @@ class MainActivity : ComponentActivity() {
         hudRecorder.observeStateBroadcasts()
         startHudStateMirror()
         startCustomerSessionWatcher()
+        qaController.bindScope(lifecycleScope)
         maybeRunMicProbe()
         ensureCameraPermission()
         ensureAudioPermission()
 
         Log.i(TAG, "recording trigger key = ${BuildConfig.RECORDING_KEY} (${KeyEvent.keyCodeToString(BuildConfig.RECORDING_KEY)})")
         Log.i(TAG, "session stop key = ${BuildConfig.SESSION_KEY} (${KeyEvent.keyCodeToString(BuildConfig.SESSION_KEY)})")
+        Log.i(TAG, "Q&A toggle key = ${BuildConfig.QA_TOGGLE_KEY} (${KeyEvent.keyCodeToString(BuildConfig.QA_TOGGLE_KEY)})")
         if (BuildConfig.RECORDING_KEY == BuildConfig.SESSION_KEY) {
             Log.w(TAG, "recordingKey and sessionKey are the same; set shiftmind.sessionKey to a different physical button")
         }
@@ -178,6 +196,12 @@ class MainActivity : ComponentActivity() {
     }
 
     override fun onPause() {
+        // Tear down Q&A first so its open voice capture (if any) is discarded
+        // and isn't mistaken for a customer-session recording below.
+        if (QAModeHolder.current) {
+            qaController.cancelIfRecording()
+            QAModeHolder.exit()
+        }
         // If we're paused mid-recording, stop the recorders cleanly first so
         // the MP4 finalizes. Then release camera.
         if (recorder.isRecording) {
@@ -206,16 +230,35 @@ class MainActivity : ComponentActivity() {
     override fun dispatchKeyEvent(event: KeyEvent): Boolean {
         if (event.action == KeyEvent.ACTION_DOWN && event.repeatCount == 0) {
             Log.i(TAG, "keyEvent: code=${event.keyCode} (${KeyEvent.keyCodeToString(event.keyCode)}) scan=${event.scanCode}")
-            if (event.keyCode == BuildConfig.RECORDING_KEY) {
-                onRecordingButtonPressed()
-                return true   // consume — don't let system also process this key
-            }
-            if (event.keyCode == BuildConfig.SESSION_KEY) {
-                onSessionButtonPressed()
-                return true
+            when (event.keyCode) {
+                BuildConfig.RECORDING_KEY -> {
+                    // AR recording toggle (only outside Q&A).
+                    if (!QAModeHolder.current) onRecordingButtonPressed()
+                    return true
+                }
+                BuildConfig.QA_TOGGLE_KEY -> {
+                    // Q&A mode toggle (enter when idle, exit when active).
+                    // Debounced to avoid accidental double-toggles.
+                    trySwipeToggle()
+                    return true
+                }
+                BuildConfig.SESSION_KEY -> {
+                    // Button 23: Q&A speak action when in Q&A, stop session when outside.
+                    if (QAModeHolder.current) qaController.onActionKey()
+                    else onSessionButtonPressed()
+                    return true
+                }
             }
         }
         return super.dispatchKeyEvent(event)
+    }
+
+    /** Debounce-wrapped Q&A toggle for touchpad swipe-down. */
+    private fun trySwipeToggle() {
+        val now = SystemClock.uptimeMillis()
+        if (now - lastSwipeToggleMs < SWIPE_DEBOUNCE_MS) return
+        lastSwipeToggleMs = now
+        toggleQaMode()
     }
 
     /**
@@ -263,6 +306,28 @@ class MainActivity : ComponentActivity() {
         Toast.makeText(this, "■ Customer session saved", Toast.LENGTH_SHORT).show()
     }
 
+    /**
+     * Toggle Q&A mode (called on touchpad swipe-down).
+     *
+     * Enter only when no customer session is active and no voice capture is
+     * running; exit otherwise, discarding any open Q&A capture.
+     */
+    private fun toggleQaMode() {
+        if (QAModeHolder.current) {
+            QAModeHolder.exit()
+            qaController.cancelIfRecording()
+            HudStateHolder.mutate { it.copy(statusLine = "awaiting customer") }
+            Toast.makeText(this, "exit Q&A", Toast.LENGTH_SHORT).show()
+        } else if (CustomerSessionHolder.current == null && !voiceSessionRecorder.isRecording) {
+            QAModeHolder.enter()
+            HudStateHolder.mutate { it.copy(statusLine = "Q&A mode") }
+            lifecycleScope.launch { qaController.enter() }
+            Toast.makeText(this, "Q&A mode", Toast.LENGTH_SHORT).show()
+        } else {
+            Toast.makeText(this, "finish customer session first", Toast.LENGTH_SHORT).show()
+        }
+    }
+
     /** Stop camera recorder + tell screenstream to stop the HUD recorder. */
     private fun stopRecording() {
         if (recorder.isRecording) recorder.stop()
@@ -272,6 +337,13 @@ class MainActivity : ComponentActivity() {
     private fun startCustomerSessionWatcher() {
         lifecycleScope.launch {
             CustomerSessionHolder.stateFlow.collect { session ->
+                // Defense-in-depth: if a customer session somehow activates
+                // while Q&A is open (recognition is gated, but be safe), tear
+                // Q&A down so the HUD swaps back to the customer card.
+                if (session != null && QAModeHolder.current) {
+                    QAModeHolder.exit()
+                    qaController.cancelIfRecording()
+                }
                 if (session == null) return@collect
                 startCustomerSession(session)
             }
@@ -402,6 +474,10 @@ class MainActivity : ComponentActivity() {
     }
 
     override fun onDestroy() {
+        if (QAModeHolder.current) {
+            qaController.cancelIfRecording()
+            QAModeHolder.exit()
+        }
         if (voiceSessionRecorder.isRecording) stopCustomerSession()
         if (recorder.isRecording) stopRecording()
         hudRecorder.stopObservingStateBroadcasts()
@@ -414,6 +490,7 @@ class MainActivity : ComponentActivity() {
     companion object {
         private const val TAG = "ShiftMind.Main"
         private const val TRANSCRIPT_HOLD_MS = 6_000L
+        private const val SWIPE_DEBOUNCE_MS = 600L
         private const val WAKE_LOCK_TIMEOUT_MS = 4L * 60L * 60L * 1000L
     }
 }

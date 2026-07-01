@@ -47,6 +47,9 @@ android {
         // this different from shiftmind.recordingKey so AR recording can cover
         // the whole experiment while sessions start/stop inside it.
         val sessionKey = localProp("shiftmind.sessionKey", "23")
+        // Key to toggle Q&A mode (enter when idle, exit when active).
+        // Default 21 = KEYCODE_DPAD_LEFT. Override with shiftmind.qaToggleKey=NNN.
+        val qaToggleKey = localProp("shiftmind.qaToggleKey", "21")
         // Extra rotation (degrees, multiple of 90) applied to camera texture.
         // Default -90 matches server preview: raw 640x480 sensor -> upright
         // 480x640 recording. If future hardware differs, try 0 / 90 / 180.
@@ -61,6 +64,7 @@ android {
         buildConfigField("int", "PREVIEW_FPS", previewFps)
         buildConfigField("int", "RECORDING_KEY", recordingKey)
         buildConfigField("int", "SESSION_KEY", sessionKey)
+        buildConfigField("int", "QA_TOGGLE_KEY", qaToggleKey)
         buildConfigField("int", "RECORDING_ROTATION_DEG", recordingRotation)
         buildConfigField("boolean", "AUDIO_PROBE", audioProbe)
     }

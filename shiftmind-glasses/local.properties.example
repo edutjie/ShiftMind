@@ -29,8 +29,13 @@ shiftmind.recordingKey=66
 # Optional: Android KeyEvent.KEYCODE that stops the active customer session
 # voice/transcript flow. Keep this different from shiftmind.recordingKey so
 # AR recording can run across the whole experiment while sessions end inside it.
+# When in Q&A mode, this same button triggers the speak action (record/stop/send).
 # Default 23 = KEYCODE_DPAD_CENTER.
 shiftmind.sessionKey=23
+
+# Optional: Android KeyEvent.KEYCODE that toggles Q&A mode (enter/exit).
+# Default 21 = KEYCODE_DPAD_LEFT.
+shiftmind.qaToggleKey=21
 
 # Optional: extra rotation applied to the camera texture before encoding.
 # Default -90 matches the server preview rotation: raw 640x480 sensor input

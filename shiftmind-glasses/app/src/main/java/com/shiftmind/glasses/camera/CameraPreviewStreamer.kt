@@ -21,6 +21,7 @@ import com.shiftmind.glasses.BuildConfig
 import com.shiftmind.glasses.hud.HudStateHolder
 import com.shiftmind.glasses.session.CustomerSessionHolder
 import com.shiftmind.glasses.net.PreviewClient
+import com.shiftmind.glasses.qa.QAModeHolder
 import java.io.ByteArrayOutputStream
 import java.util.concurrent.atomic.AtomicLong
 
@@ -289,7 +290,11 @@ class CameraPreviewStreamer(
                 faceCropJpeg = latestFaceCropJpeg,
                 faceBox = latestFaceBoxJson,
             )
-            faceGateDetector?.process(nv21)
+            // Q&A mode suspends on-device face detection. Preview JPEGs still
+            // stream above so the laptop preview stays live; we just stop
+            // running the gate so no recognition can fire while the user is
+            // asking a question.
+            if (!QAModeHolder.current) faceGateDetector?.process(nv21)
         } catch (t: Throwable) {
             Log.w(TAG, "frame handler error", t)
         } finally {
@@ -367,6 +372,7 @@ class CameraPreviewStreamer(
 
     private fun onFaceGateResult(result: FaceGateResult) {
         if (CustomerSessionHolder.current != null) return
+        if (QAModeHolder.current) return  // belt-and-suspenders: drop in-flight results during Q&A
         val faceBox = result.faceBox
         if (result.faceInCursor && faceBox != null) {
             latestFaceCropJpeg = result.faceCropJpeg

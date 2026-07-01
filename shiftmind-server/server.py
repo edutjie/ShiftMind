@@ -65,6 +65,8 @@ async def root() -> dict:
             "/api/sessions",
             "/api/qa.html",
             "/api/qa/ask",
+            "/api/qa/ask-audio",
+            "/api/qa/last-glasses",
         ],
     }
 
