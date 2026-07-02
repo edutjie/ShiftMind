@@ -111,7 +111,16 @@ class QaController(
                 )
                 return@launch
             }
-            val r = qaClient.askText(question)
+
+            // Build history from QAModeHolder for contextual follow-up questions
+            val history = QAModeHolder.history.map { turn ->
+                com.shiftmind.glasses.net.QaHistoryTurn(
+                    role = turn.role,
+                    content = turn.content
+                )
+            }
+
+            val r = qaClient.askText(question, history)
             if (r == null) {
                 _state.value = QaUiState.Error("server unreachable")
                 return@launch
@@ -121,6 +130,11 @@ class QaController(
                 return@launch
             }
             val text = r.shortAnswer.ifBlank { r.fullAnswer.ifBlank { "(no answer)" } }
+
+            // Add this turn to history (both question and answer)
+            QAModeHolder.addTurn("user", question)
+            QAModeHolder.addTurn("assistant", r.fullAnswer.ifBlank { text })
+
             _state.value = QaUiState.Answer(question = r.question, text = text)
         }
     }

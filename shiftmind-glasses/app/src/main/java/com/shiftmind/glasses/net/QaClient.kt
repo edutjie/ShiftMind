@@ -29,6 +29,14 @@ data class QaAnswer(
 )
 
 /**
+ * A single conversation turn for Q&A history.
+ */
+data class QaHistoryTurn(
+    val role: String,
+    val content: String,
+)
+
+/**
  * OkHttp wrapper for the glasses Q&A text endpoint.
  *
  * Generous read timeout (120s): the server agent loop + `_shorten_answer` can
@@ -37,6 +45,9 @@ data class QaAnswer(
  *
  * The spoken question is transcribed separately via [QaAudioStreamClient]
  * (Doubao streaming); this client only POSTs the resulting text to /api/qa/ask.
+ *
+ * Supports message history for contextual follow-up questions (e.g., "who was
+ * the last customer?" followed by "what did he buy?").
  */
 class QaClient(private val baseUrl: String = BuildConfig.SERVER_URL) {
     private val client = OkHttpClient.Builder()
@@ -46,12 +57,31 @@ class QaClient(private val baseUrl: String = BuildConfig.SERVER_URL) {
         .retryOnConnectionFailure(false)
         .build()
 
-    /** POST /api/qa/ask with a text question. Null on network/HTTP failure. */
-    suspend fun askText(question: String): QaAnswer? = withContext(Dispatchers.IO) {
-        val body = JSONObject()
-            .put("question", question)
-            .toString()
-            .toRequestBody("application/json".toMediaType())
+    /**
+     * POST /api/qa/ask with a text question and optional history.
+     * Null on network/HTTP failure.
+     *
+     * @param question Current question text
+     * @param history Optional list of previous conversation turns for context
+     */
+    suspend fun askText(
+        question: String,
+        history: List<QaHistoryTurn> = emptyList(),
+    ): QaAnswer? = withContext(Dispatchers.IO) {
+        val bodyJson = JSONObject().apply {
+            put("question", question)
+            if (history.isNotEmpty()) {
+                put("history", org.json.JSONArray().apply {
+                    history.forEach { turn ->
+                        put(JSONObject().apply {
+                            put("role", turn.role)
+                            put("content", turn.content)
+                        })
+                    }
+                })
+            }
+        }
+        val body = bodyJson.toString().toRequestBody("application/json".toMediaType())
         val req = Request.Builder()
             .url("${baseUrl.trimEnd('/')}/api/qa/ask")
             .post(body)
