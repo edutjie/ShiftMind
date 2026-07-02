@@ -2,7 +2,7 @@
 
 AR-glasses shared-memory retrieval system for retail workers. Rokid AR glasses surface a HUD "memory card" when a returning customer is recognized, plus live transcript triggers (product mentions, intent) during the interaction.
 
-**Status:** HUD on glasses, raw Camera2 live preview, built-in cam+audio recording, Rokid screenstream HUD recording, and `/pull-videos` post-processing into combined review MP4s.
+**Status:** Production-ready core pipeline. Features include ML Kit face detection, InsightFace+Milvus recognition, live customer sessions with Doubao streaming ASR, AR recording (cam+audio+HUD), LLM summarization, and glasses-side Q&A mode with conversation history for business intelligence queries.
 
 ## Repository layout
 
@@ -94,19 +94,30 @@ Two processes, plain HTTP, no phone middleware. Dev transport is USB-via-`adb re
 ┌──────────────────────────┐    POST /api/detect-face    ┌──────────────────────────┐
 │ Rokid glasses APK        │ ─────────────────────────→  │ Laptop FastAPI server    │
 │                          │ ←─── customer + memory ──── │                          │
-│ Camera2 + ML Kit face    │                             │ insightface + FAISS      │
-│ Compose HUD              │    POST /api/transcribe     │ Whisper STT              │
-│ AudioRecord              │ ─────────────────────────→  │ Trigger classifier       │
-│ Foreground service       │    POST /api/chat           │ VLM relay                │
-│ cam+HUD recording        │                             │ SQLite customer DB       │
-└──────────────────────────┘                             └──────────────────────────┘
+│ Camera2 + ML Kit face    │                             │ InsightFace + Milvus     │
+│ Compose HUD              │    WS /audio-stream         │ Doubao Seed ASR          │
+│ AudioRecord              │ ─────────────────────────→  │ LLM summarization        │
+│ Foreground service       │    POST /session/finish     │ SQLite customer DB       │
+│ cam+HUD recording        │                             │ Q&A agent (6 tools)      │
+│ Q&A mode (swipe gesture) │    POST /api/qa/ask         │ Session memory vectors   │
+└──────────────────────────┘ ←─── business insights ──── └──────────────────────────┘
 ```
+
+**Core Features Implemented:**
+
+| Feature | Description |
+| :--- | :--- |
+| **Face Recognition** | ML Kit on-device detection → InsightFace `buffalo_l` embeddings → Milvus vector search. Voting system (3 of 5 crops) with automatic session start. |
+| **Customer Sessions** | Automatic session creation on face confirmation. Live transcript accumulation via Doubao streaming ASR. Server-side summarization + memory card updates on session finish. |
+| **AR Recording** | Built-in cam+audio MP4 (Camera2 multi-output + MediaCodec H.264) + HUD MP4 (Rokid screenstream). Shared PTS anchor for A/V sync. Back-mic routing for far-field customer speech. |
+| **Q&A Mode** | Swipe-forward gesture enters glasses-side Q&A. Voice questions → Doubao ASR → agent with 6 tools (SQL, vector search, customer profile, compare, outliers). Maintains conversation history (20 turns) for contextual follow-ups. |
+| **Login/Auth** | Employee + location login via web UI. PIN support. Active login stamped onto sessions for scoped Q&A queries. |
+| **Memory Management** | Per-session summaries + important points. Cumulative memory card (bounded via LLM re-summarization). Session memories embedded into Milvus for semantic recall. |
 
 See `CLAUDE.md` for design constraints + gotchas, `shiftmind-glasses/README.md` and `shiftmind-server/README.md` for module-specific details.
 
 ## Still Pending
 
-Glasses: ML Kit face detection and production network settings.
-Server: real face recognition (insightface/FAISS), Whisper STT, trigger classifier, VLM relay, SQLite persistence.
+Trigger classifier (phase 6), VLM relay for product queries (phase 6).
 
 Phase order and per-phase deliverables: `architecture_v2.md` §"Priority order to build" in the vault.

@@ -1,9 +1,6 @@
 # shiftmind-server
 
-Laptop FastAPI backend for ShiftMind. Current dev server: health endpoint,
-live MJPEG preview, ML Kit face-crop ingestion, InsightFace `buffalo_l`
-recognition, SQLite customer storage, Milvus Lite embedding search, and
-customer interaction session summarization.
+Laptop FastAPI backend for ShiftMind. Production features: InsightFace `buffalo_l` face recognition with Milvus vector search, automatic customer session lifecycle, Doubao Seed ASR streaming, LLM summarization with memory management, session memory embeddings, Q&A agent with 6 tools (SQL, vector search, customer profile, compare, outliers), and employee/location login for scoped queries.
 
 ## Setup
 
@@ -48,23 +45,24 @@ DOUBAO_ASR_RESOURCE_ID=volc.seedasr.sauc.duration
 DOUBAO_ASR_MODEL=bigmodel
 ```
 
-Session finish works without credentials, but only stores a fallback "no transcript"
-summary. Add these for OpenAI-compatible summary/fallback transcription:
+Session finish and Q&A agent require OpenAI-compatible LLM credentials. Without
+them, sessions get fallback "no transcript" summaries and Q&A agent returns an
+error. Add these for full functionality:
 
 ```bash
 SHIFTMIND_LLM_API_KEY=...
 SHIFTMIND_LLM_BASE_URL=...       # optional OpenAI-compatible base URL
-SHIFTMIND_TRANSCRIBE_MODEL=whisper-large-v3-turbo
+SHIFTMIND_TRANSCRIBE_MODEL=whisper-large-v3-turbo   # fallback if Doubao unavailable
 SHIFTMIND_LLM_MODEL="gpt-5.4-mini"
 ```
 
 `OPENAI_API_KEY` / `OPENAI_BASE_URL` remain backward-compatible fallbacks.
 
-The Q&A agent uses the LLM client above. Text embeddings can use a separate
-OpenAI-compatible provider and land in a second Milvus Lite collection
-(`session_memories`); the dim is fixed at collection creation, so set these
-before the first run (and don't change them afterward without dropping the
-collection):
+The Q&A agent uses the LLM client above. Text embeddings (for session memory
+vector search) can use a separate OpenAI-compatible provider and land in a
+second Milvus Lite collection (`session_memories`); the dim is fixed at
+collection creation, so set these before the first run (and don't change them
+afterward without dropping the collection):
 
 ```bash
 SHIFTMIND_EMBED_API_KEY=...
@@ -82,16 +80,25 @@ SHIFTMIND_EMBED_DIM=1536                       # must match the model's output d
 | `/api/enroll-face` | POST | Debug endpoint. Form `person_id`, `name`, `memory_card`; embeds latest face crop and stores customer in SQLite + Milvus Lite. |
 | `/api/faces.html` | GET | Debug page for latest face crop, vote state, customers, Milvus count, and enrollment. |
 | `/api/preview-frame` | POST | Dev-only. Multipart `image=<jpeg>` plus optional `face_crop=<jpeg>`. Stores preview frame and recognizes face crops. |
-| `/api/session-status` | GET | Current active customer session, if any. |
+| `/api/session-status` | GET | Current active customer session (session_id, customer, memory_card, live_transcript), if any. Polled by glasses for HUD updates. |
 | `/api/session/{session_id}/audio-stream` | WS | Glasses stream 16 kHz PCM chunks; server relays to Doubao ASR and returns live transcript JSON. |
-| `/api/session/{session_id}/finish` | POST | Multipart `audio=<wav>` plus optional `transcript`. Transcribes/summarizes, updates SQLite memory, ends the session. |
+| `/api/session/{session_id}/finish` | POST | Multipart `audio=<wav>` plus optional `transcript`. Transcribes/summarizes, updates SQLite memory + Milvus session_memories, ends the session. |
 | `/api/sessions` | GET | JSON debug list of active/recent sessions. |
 | `/api/preview` | GET | Live MJPEG stream (`multipart/x-mixed-replace`). Rotated 90° clockwise to compensate for the Rokid 270° sensor mount — see `PREVIEW_ROTATE_CV2` in `api/preview.py`. Open in any browser. |
 | `/api/preview-face` | GET | Live MJPEG stream of the latest face crop. |
 | `/api/preview.html` | GET | Convenience page showing HUD preview + latest face crop. |
 | `/api/preview-status` | GET | Preview, face crop, and recognition status JSON. |
-| `/api/qa.html` | GET | Q&A agent page. Employee types a business-insight question; the agent calls `run_sql` / `vector_search` tools and renders the answer + tool trace + sources. |
-| `/api/qa/ask` | POST | JSON `{question, filters?}`. Runs the tool-calling loop, returns `{answer, short_answer, trace, sources, iterations, elapsed_ms}`. |
+| `/api/login.html` | GET | Employee/location login page with optional PIN. |
+| `/api/login` | POST | Session login. Returns employee + location info. |
+| `/api/logout` | POST | Clear active login session. |
+| `/api/whoami` | GET | Current active employee/location (consumed by glasses via preview response). |
+| `/api/admin/location` | POST | Dev seed: create location. |
+| `/api/admin/employee` | POST | Dev seed: create employee with optional PIN. |
+| `/api/qa.html` | GET | Q&A agent dashboard. Employee types a business-insight question; the agent calls 6 tools and renders the answer + tool trace + sources. Maintains conversation history for follow-ups. |
+| `/api/qa/ask` | POST | JSON `{question, filters?, history?}`. Runs the tool-calling loop, returns `{answer, short_answer, trace, sources, iterations, elapsed_ms}`. |
+| `/api/qa/ask-audio` | POST | Multipart `audio=<wav>`. Transcribes → agent. For glasses voice Q&A (not currently used — glasses use `/api/qa/audio-stream` + `/api/qa/ask` instead). |
+| `/api/qa/audio-stream` | WS | Glasses Q&A live ASR stream (decoupled from customer sessions). Relays PCM to Doubao, returns partial/final transcripts. |
+| `/api/qa/last-glasses` | GET | Recent glasses Q&A turns (newest first) for the dashboard panel. Auto-refreshes every 4s. |
 | `/api/qa/filters` | GET | Dropdown options (locations, employees, top topics, date range) for the Q&A filter bar. |
 | `/api/qa/suggestions` | GET | Suggested-question chips from real DB stats. `?creative=1` for LLM-generated. |
 | `/api/qa/snapshot` | GET | Pre-baked stats dashboard (totals, conversion, top topics/employees/locations). `?narrative=1` adds an LLM summary. |
@@ -140,19 +147,21 @@ transcripts.
 ## Q&A agent
 
 `/api/qa.html` exposes a tool-calling agent over the collected interaction
-history. An OpenAI-compatible chat loop picks between six tools per question:
+history. An OpenAI-compatible chat loop picks between **six tools** per question:
 
-- `run_sql` — read-only SELECT against SQLite (counts, rates, rankings, time
-  trends, filters by employee/location/outcome/date). Driver-level `mode=ro`
-  plus a statement guard and a 50-row cap; writes/DDL/multi-statement rejected.
-- `vector_search` — semantic search over the `session_memories` Milvus
-  collection (topical/free-form recall), filterable by employee/location/date.
-- `search_customers` → `customer_profile` — resolve a customer by name/topic,
-  then pull their full profile (sessions, topics, outcomes, memory_card,
-  preferences, first/last seen). For "tell me about the customer who…".
-- `compare` — side-by-side stats for two employees or two locations.
-- `find_outliers` — anomalies: longest sessions, employees far from mean
-  conversion, topics with abnormally long discussions.
+1. **`run_sql`** — read-only SELECT against SQLite (counts, rates, rankings, time
+   trends, filters by employee/location/outcome/date). Driver-level `mode=ro`
+   plus a statement guard and a 50-row cap; writes/DDL/multi-statement rejected.
+2. **`vector_search`** — semantic search over the `session_memories` Milvus
+   collection (topical/free-form recall), filterable by employee/location/date.
+3. **`search_customers`** — resolve a customer by name or topic keywords.
+4. **`customer_profile`** — pull full customer details (sessions, topics, outcomes,
+   memory_card, preferences, first/last seen). For "tell me about the customer who…".
+5. **`compare`** — side-by-side stats for two employees or two locations.
+6. **`find_outliers`** — anomalies: longest sessions, employees far from mean
+   conversion, topics with abnormally long discussions.
+
+Max 6 iterations per query. Tool results capped at 4000 chars. JSON mode output parsing.
 
 The page renders the agent's markdown answer (lists, bold, code), shows a
 tool-call trace + source sessions, and exposes:
@@ -170,8 +179,19 @@ tool-call trace + source sessions, and exposes:
 - **Conversation memory** — prior turns are sent with each ask so follow-ups
   ("and for last week?") resolve against context. "↺ clear chat" resets.
 - **`short_answer`** — every `/api/qa/ask` response includes a ≤140-char
-  plain-text distillation for the eventual AR-glasses HUD (matches the
-  `liveTranscript` budget). Glasses-side rendering is a future change.
+  plain-text distillation for the glasses AR HUD (matches the
+  `liveTranscript` budget). Glasses render this in Q&A mode.
+- **Glasses Q&A log** — bottom panel shows recent spoken questions from glasses
+  with full answers. Auto-refreshes every 4s via `GET /api/qa/last-glasses`.
+
+### Glasses integration
+
+Swipe-forward gesture on touchpad enters Q&A mode:
+1. Single-tap → record voice question (live ASR via `WS /api/qa/audio-stream`)
+2. Tap again → send transcript + conversation history to `POST /api/qa/ask`
+3. Display `short_answer` on AR HUD (≤140 chars); full answer visible on server dashboard
+4. History maintained for 20 turns (10 Q&A pairs) for contextual follow-ups
+5. Swipe-forward again → exit Q&A mode, clear history
 
 Simulated dataset for paper testing (`scripts/seed_simulated.py`, prefix-isolated
 `sim-*` cohort, non-destructive):

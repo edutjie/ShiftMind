@@ -1,6 +1,6 @@
 # shiftmind-glasses
 
-Single-module Kotlin/Compose Android app for Rokid AR glasses (`RG-glasses` / Max Pro). Phase 1.5: HUD bootstrap showing "ShiftMind" with a face-sized box cursor at screen center, plus a **Camera2 → JPEG → `/api/preview-frame`** streamer so the laptop can see what the glasses see.
+Single-module Kotlin/Compose Android app for Rokid AR glasses (`RG-glasses` / Max Pro). Production features: ML Kit on-device face detection with cursor overlap + frontal filtering, Camera2 multi-output recording (cam+audio + HUD), back-mic routing for far-field speech, Doubao streaming ASR, automatic customer session lifecycle, and Q&A mode (swipe-forward gesture) with conversation history for business intelligence queries.
 
 ## Prerequisites
 
@@ -112,13 +112,30 @@ Confirm frames land on the server: open `http://localhost:8000/api/preview.html`
 | File | Role |
 | :--- | :--- |
 | `GlassesApplication.kt` | Empty `Application` subclass. **Does NOT** start the foreground service — Android 12+ rejects FGS starts from `Application.onCreate`. |
-| `MainActivity.kt` | Hosts the Compose HUD; requests CAMERA permission; starts `GlassesService` + screen-wake lock + `CameraPreviewStreamer`. `FLAG_KEEP_SCREEN_ON` + `setTurnScreenOn` + `SCREEN_BRIGHT_WAKE_LOCK \| ACQUIRE_CAUSES_WAKEUP` so the Rokid prism reports display-on to AOSP. |
+| `MainActivity.kt` | Hosts the Compose HUD; requests CAMERA permission; starts `GlassesService` + screen-wake lock + `CameraPreviewStreamer`. `FLAG_KEEP_SCREEN_ON` + `setTurnScreenOn` + `SCREEN_BRIGHT_WAKE_LOCK \| ACQUIRE_CAUSES_WAKEUP` so the Rokid prism reports display-on to AOSP. Handles touchpad gestures (swipe-forward → Q&A mode toggle, single-tap → record/ask). Polls `/api/session-status` for HUD state updates. |
 | `service/GlassesService.kt` | Foreground service: notification + wake lock. Passes only `FOREGROUND_SERVICE_TYPE_CONNECTED_DEVICE` to `startForeground` (Android 14 strict — `CAMERA` type would require perm grant at the exact moment of `startForeground`). |
-| `hud/HudScreen.kt` | Title at TopCenter, BoxCursor at viewport center. No prism mirror flag (see note below). |
+| `hud/HudScreen.kt` | Title at TopCenter, BoxCursor at viewport center, customer card (memory + live transcript), Q&A screen. No prism mirror flag (see note below). |
+| `hud/HudStateHolder.kt` | Global HUD state (scanning/confirmed/active session). Consumed by prism display and Rokid screenstream. |
 | `hud/BoxCursor.kt` | Center face slot — 240dp, corner brackets + center crosshair. |
 | `ui/theme/Theme.kt` | Bright-green-on-black dark scheme. Material3 light scheme washes out on AR optics. |
-| `camera/CameraPreviewStreamer.kt` | Raw Camera2 (`CameraManager.openCamera("0", ...)`) → `ImageReader` YUV_420_888 @ 640×480 → NV21 → `YuvImage.compressToJpeg` → `PreviewClient.postFrame`. Throttled to `BuildConfig.PREVIEW_FPS`. Self-retries with backoff (500ms → 5s) on `CAMERA_IN_USE` / session-configure failures so the AR recorder can hand back the sensor cleanly. |
+| `camera/CameraPreviewStreamer.kt` | Raw Camera2 (`CameraManager.openCamera("0", ...)`) → `ImageReader` YUV_420_888 @ 640×480 → NV21 → `YuvImage.compressToJpeg` → `PreviewClient.postFrame`. Throttled to `BuildConfig.PREVIEW_FPS`. Self-retries with backoff (500ms → 5s) on `CAMERA_IN_USE` / session-configure failures so the AR recorder can hand back the sensor cleanly. Integrates `FaceGateDetector` for on-device ML Kit face detection. |
+| `camera/FaceGateDetector.kt` | ML Kit face detection with cursor overlap (35% threshold), frontal face filtering (max yaw ±25°), minimum-motion frame selection (luma diff), temporal stability (tolerates 3 missed detections). Produces JPEG crop with 28% padding for server recognition. |
 | `net/PreviewClient.kt` | OkHttp wrapper for POST `/api/preview-frame`. Aggressive timeouts (1.5s connect, 2s write/read). Never throws — failures logged + counted. |
+| `net/SessionClient.kt` | OkHttp wrapper for POST `/api/session/{id}/finish`. Uploads WAV audio + optional transcript. |
+| `net/SessionAudioStreamClient.kt` | WebSocket client for live ASR during customer sessions. Streams 16kHz PCM → server → Doubao. |
+| `session/CustomerSessionHolder.kt` | Global customer session state (session_id, customer name, memory card). Polled from server via `/api/session-status`. |
+| `qa/QaController.kt` | Q&A mode state machine (Idle → Recording → Thinking → Answer/Error). Voice capture via back-mic + Doubao streaming ASR. |
+| `qa/QAModeHolder.kt` | Global Q&A mode flag + conversation history (max 20 turns). Clears history on exit. |
+| `qa/QAScreen.kt` | Dedicated AR HUD for Q&A mode with live transcript + short answer display. |
+| `net/QaClient.kt` | OkHttp wrapper for POST `/api/qa/ask`. Sends question + conversation history for contextual follow-ups. |
+| `net/QaAudioStreamClient.kt` | WebSocket client for Q&A voice streaming (decoupled from customer sessions). |
+| `recording/ArRecorder.kt` | Orchestrates cam+audio+HUD recording. Uses Camera2 multi-output session (ImageReader + SurfaceTexture). |
+| `recording/VideoEncoder.kt` | MediaCodec H.264 encoder. Rebases PTS via shared anchor to sync with audio. |
+| `recording/AudioEncoder.kt` | MediaCodec AAC encoder. Uses `AudioSource.MIC` with back-mic routing for far-field speech. |
+| `recording/VoiceSessionRecorder.kt` | Voice capture for customer sessions + Q&A. Routes to back-mic device (id 23) to bypass wearer-facing Fluence beamforming. |
+| `recording/HudCompositor.kt` | OpenGL ES compositor that reads SurfaceTexture (camera) and renders to encoder surface. `setPtsAnchor()` rebases video PTS to match audio. |
+| `recording/RokidHudRecorder.kt` | Broadcasts to Rokid screenstream service for HUD-only MP4. Requires `intent.setPackage("com.rokid.os.master.screenstream")`. |
+| `recording/MicConfigProbe.kt` | Diagnostic tool (gated by `BuildConfig.AUDIO_PROBE`). Tests multiple AudioSource + channel mask combinations, logs per-config/per-channel dBFS. Runs at app start before Camera2 opens. |
 | `recording/RecordingStateReceiver.kt` | Diagnostic listener for external Rokid `mix_record` and screenstream broadcasts. ShiftMind no longer releases camera for external recorders; it logs conflicts only. |
 
 ## Non-obvious things baked in (don't accidentally undo)
@@ -218,11 +235,41 @@ We still listen for the Rokid `mix_record` broadcast (`com.rokid.os.master.assis
 
 
 
+## Q&A Mode (Business Intelligence)
+
+**Status:** Production-ready. Swipe-forward gesture (touchpad back→front) enters Q&A mode for voice-driven business insights over collected session history.
+
+### How it works
+
+1. **Enter:** Swipe forward on touchpad while no customer session is active
+2. **Ask:** Single-tap to start recording → speak your question → tap again to stop
+3. **Live transcript:** Question appears on HUD as you speak (Doubao streaming ASR)
+4. **Answer:** Short answer (≤140 chars) displays on HUD; full answer + tool trace visible on server dashboard
+5. **Follow-ups:** Conversation history maintained (20 turns) so "what did he buy?" references prior "who was the last customer?"
+6. **Exit:** Swipe forward again to exit Q&A mode and return to face scanning
+
+### Example questions
+
+- "Who was the last customer that came here?"
+- "What did he want to buy?" ← contextual follow-up
+- "Show me conversion rate for last week"
+- "Which employees have the longest conversations?"
+- "What topics do customers ask about most?"
+
+Server-side agent has 6 tools: SQL queries, vector search over session memories, customer profile lookup, employee/location comparison, outlier detection. Web dashboard at `http://localhost:8000/api/qa.html` shows full answers + tool traces + sources.
+
+### Config
+
+Q&A toggle key defaults to swipe-forward. Customize in `local.properties`:
+```properties
+shiftmind.qaToggleKey=115   # KEYCODE_FORWARD (swipe forward)
+```
+
+Requires `DOUBAO_ASR_API_KEY` on server for voice transcription (see `../shiftmind-server/README.md`).
+
 ## Not in this phase
 
-- ML Kit face detection (phase 2 — will hook into the existing CameraPreviewStreamer)
-- `/api/detect-face` round-trip on face-in-cursor (phase 3)
-- AudioRecord capture + `/api/transcribe` (phase 5)
-- `mix_record` broadcast triggered FROM ShiftMind itself (we currently only listen for it — phase 8)
+- Trigger classifier (phase 6)
+- VLM relay (`/api/chat`) for product queries (phase 6)
 
 See `../CLAUDE.md` and vault `Projects/ShiftMind/architecture_v2.md` for the full plan.
