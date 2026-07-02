@@ -1,6 +1,9 @@
 package com.shiftmind.glasses.recording
 
+import android.content.Context
+import android.media.AudioDeviceInfo
 import android.media.AudioFormat
+import android.media.AudioManager
 import android.media.AudioRecord
 import android.media.AudioTimestamp
 import android.media.MediaCodec
@@ -32,6 +35,7 @@ import java.nio.ByteBuffer
  * the whole audio track later in the MP4 timeline.
  */
 class AudioEncoder(
+    private val context: Context,
     private val muxer: RecordingMuxer,
     private val sampleRate: Int = 16_000,
     private val bitrate: Int = 48_000,
@@ -58,10 +62,14 @@ class AudioEncoder(
     @Volatile private var draining = false
 
     private var totalFramesRead: Long = 0L
-    // Use hardware timestamp as PTS anchor to get true sample rate.
+    // Shared CLOCK_MONOTONIC anchor for A/V sync.
+    private var recordingStartNs: Long = 0L
+    // Hardware timestamp tracking to avoid discontinuity when HW ts becomes available.
     private val audioTimestamp = AudioTimestamp()
     private var firstHwTimestampNs: Long = 0L
     private var framesAtFirstHwTimestamp: Long = 0L
+    // PTS offset to apply when transitioning from fallback to HW timestamp.
+    private var ptsOffsetUs: Long = 0L
 
     private val pcmReadBufSize: Int
     private val pcmTempBuf: ShortArray
@@ -84,6 +92,19 @@ class AudioEncoder(
         // Rokid HAL at declared 16kHz. No resampling, no timestamp correction.
         val record = openAudioRecord(MediaRecorder.AudioSource.MIC)
             ?: error("AudioRecord failed for MIC")
+
+        // Route to the Built-In Back Mic, matching VoiceSessionRecorder's routing.
+        // This ensures consistent audio quality (captures both wearer and customer
+        // speech) and avoids potential device contention if both recorders run
+        // simultaneously during live transcription + AR recording.
+        val backMic = findBackMic()
+        if (backMic != null) {
+            val ok = record.setPreferredDevice(backMic)
+            Log.i(TAG, "AR audio encoder setPreferredDevice(backMic id=${backMic.id}) -> $ok")
+        } else {
+            Log.w(TAG, "no Built-In Back Mic found for AR recording — using default input")
+        }
+
         audioRecord = record
 
         val mediaFormat = MediaFormat.createAudioFormat(
@@ -122,6 +143,7 @@ class AudioEncoder(
 
     fun start(startEpochNs: Long = System.nanoTime()) {
         check(codec != null && audioRecord != null) { "call prepare() first" }
+        recordingStartNs = startEpochNs
         codec!!.start()
         audioRecord!!.startRecording()
         running = true
@@ -195,11 +217,17 @@ class AudioEncoder(
         // deliver faster than declared 16kHz). Use for PTS, not resampling.
         if (!eos && framesRead > 0) {
             val tsOk = rec.getTimestamp(audioTimestamp, AudioTimestamp.TIMEBASE_MONOTONIC)
-            if (tsOk == AudioRecord.SUCCESS && audioTimestamp.framePosition > 0) {
+            if (tsOk == AudioRecord.SUCCESS && audioTimestamp.framePosition > 0 && audioTimestamp.nanoTime > 0) {
                 if (firstHwTimestampNs == 0L) {
+                    // First valid HW timestamp - capture the offset between fallback
+                    // PTS (sample-based) and HW timestamp to avoid discontinuity.
+                    val fallbackPtsUs = totalFramesRead * 1_000_000L / sampleRate
+                    val hwPtsUs = (audioTimestamp.nanoTime - recordingStartNs) / 1_000L
+                    ptsOffsetUs = fallbackPtsUs - hwPtsUs
+
                     firstHwTimestampNs = audioTimestamp.nanoTime
                     framesAtFirstHwTimestamp = audioTimestamp.framePosition
-                    Log.d(TAG, "first HW ts: ${audioTimestamp.nanoTime}ns @ frame ${audioTimestamp.framePosition}")
+                    Log.d(TAG, "first HW ts: ${audioTimestamp.nanoTime}ns @ frame ${audioTimestamp.framePosition}, ptsOffset=${ptsOffsetUs}us")
                 }
             }
         }
@@ -223,13 +251,24 @@ class AudioEncoder(
     }
 
     private fun computePtsUs(): Long {
-        // If hardware timestamp available, use it to compute PTS based on actual
-        // sample rate delivered by HAL (may differ from declared 16kHz).
-        // Otherwise fallback to declared sample rate.
-        if (firstHwTimestampNs > 0L && audioTimestamp.framePosition > 0) {
-            val elapsedNs = audioTimestamp.nanoTime - firstHwTimestampNs
-            return elapsedNs / 1_000L
+        // CRITICAL: Rokid hardware captures at ~15,150Hz (measured), NOT 16,000Hz
+        // (declared). Using sample-count-based PTS causes 5.6% speed-up because:
+        //   - Capture 15,150 samples in 1 real second
+        //   - Label as 16kHz → player thinks they span 15,150/16,000 = 0.947s
+        //   - Audio plays 5.6% faster than real-time
+        //
+        // Solution: Use hardware timestamps (AudioRecord.getTimestamp()) which
+        // reflect true CLOCK_MONOTONIC capture time. Anchor to the same epoch as
+        // video (recordingStartNs from System.nanoTime()) for A/V sync.
+        //
+        // To avoid discontinuity when HW timestamp becomes available (~320 frames,
+        // ~30s into recording), we compute ptsOffsetUs at transition time to ensure
+        // smooth handoff from fallback (sample-based) to HW timestamp.
+        if (audioTimestamp.framePosition > 0 && audioTimestamp.nanoTime > 0) {
+            // HW timestamp is valid - use it (ground truth) + offset for continuity.
+            return (audioTimestamp.nanoTime - recordingStartNs) / 1_000L + ptsOffsetUs
         }
+        // HW timestamp not yet available - temporary fallback.
         return totalFramesRead * 1_000_000L / sampleRate
     }
 
@@ -280,6 +319,21 @@ class AudioEncoder(
             thread.join(500)
         } catch (_: InterruptedException) {}
         Log.i(TAG, "audio encoder torn down")
+    }
+
+    /**
+     * Find the Built-In Back Mic for setPreferredDevice. Mirrors VoiceSessionRecorder's
+     * selection: prefer a BUILTIN_MIC whose product name contains "back", else
+     * the second BUILTIN_MIC entry (the array exposes two devices). Returns null
+     * if none — caller falls back to the default input.
+     */
+    private fun findBackMic(): AudioDeviceInfo? {
+        val am = context.getSystemService(AudioManager::class.java) ?: return null
+        val mics = am.getDevices(AudioManager.GET_DEVICES_ALL)
+            .filter { it.isSource && it.type == AudioDeviceInfo.TYPE_BUILTIN_MIC }
+        return mics.firstOrNull { it.productName.contains("back", ignoreCase = true) }
+            ?: mics.getOrNull(1)
+            ?: mics.firstOrNull()
     }
 
     companion object {

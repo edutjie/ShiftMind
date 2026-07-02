@@ -98,7 +98,7 @@ class ArRecorder(
             val venc = VideoEncoder(mux, videoWidth, videoHeight, fps, bitrate).also { it.prepare() }
             videoEncoder = venc
 
-            val aenc = if (withAudio) AudioEncoder(mux).also { it.prepare() } else null
+            val aenc = if (withAudio) AudioEncoder(context, mux).also { it.prepare() } else null
             audioEncoder = aenc
 
             val comp = HudCompositor(
