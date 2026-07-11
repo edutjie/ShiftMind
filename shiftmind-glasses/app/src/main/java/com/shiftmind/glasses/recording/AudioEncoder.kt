@@ -1,9 +1,6 @@
 package com.shiftmind.glasses.recording
 
-import android.content.Context
-import android.media.AudioDeviceInfo
 import android.media.AudioFormat
-import android.media.AudioManager
 import android.media.AudioRecord
 import android.media.AudioTimestamp
 import android.media.MediaCodec
@@ -35,17 +32,9 @@ import java.nio.ByteBuffer
  * the whole audio track later in the MP4 timeline.
  */
 class AudioEncoder(
-    private val context: Context,
     private val muxer: RecordingMuxer,
     private val sampleRate: Int = 16_000,
     private val bitrate: Int = 48_000,
-    /**
-     * Software gain applied to each PCM sample before encoding. Rokid HAL's
-     * AGC under-shoots for AR-glass close-talk mic placement; ×4 (~+12dB)
-     * brings spoken voice from ~-19dBFS peaks to ~-7dBFS, comfortable for
-     * Whisper. Set to 1.0f to disable.
-     */
-    private val softwareGain: Float = 4.0f,
 ) {
 
     private var audioRecord: AudioRecord? = null
@@ -60,6 +49,7 @@ class AudioEncoder(
     @Volatile private var running = false
     @Volatile private var stopRequested = false
     @Volatile private var draining = false
+    private var routeLogged = false
 
     private var totalFramesRead: Long = 0L
     // Shared CLOCK_MONOTONIC anchor for A/V sync.
@@ -76,35 +66,25 @@ class AudioEncoder(
 
     init {
         val minBuf = AudioRecord.getMinBufferSize(
-            sampleRate, AudioFormat.CHANNEL_IN_MONO, AudioFormat.ENCODING_PCM_16BIT,
+            sampleRate, RokidMicCapture.channelMask, AudioFormat.ENCODING_PCM_16BIT,
         )
         require(minBuf > 0) { "AudioRecord.getMinBufferSize failed: $minBuf" }
         // Oversize the AudioRecord internal buffer so blocking reads don't
         // drop samples if drain stalls briefly.
-        pcmReadBufSize = maxOf(minBuf * 4, sampleRate / 4 * 2) // ~250ms
-        // Per-read chunk: 20ms worth of frames (16k * 0.02 = 320 frames mono).
-        pcmTempBuf = ShortArray(sampleRate / 50)
+        pcmReadBufSize = maxOf(
+            minBuf * 4,
+            sampleRate / 4 * RokidMicCapture.INPUT_CHANNEL_COUNT * 2,
+        ) // ~250 ms of four-channel PCM
+        pcmTempBuf = ShortArray(RokidMicCapture.FRAMES_PER_CHUNK * RokidMicCapture.INPUT_CHANNEL_COUNT)
     }
 
     /** Build AudioRecord + codec. Call before [start]. */
     fun prepare() {
-        // MIC source matches VoiceSessionRecorder (ASR). Proven to work on
-        // Rokid HAL at declared 16kHz. No resampling, no timestamp correction.
+        routeLogged = false
+        // Match VoiceSessionRecorder exactly: default MIC, QUAD capture, select
+        // channel 4, emit mono. No preferred-device override and no fixed gain.
         val record = openAudioRecord(MediaRecorder.AudioSource.MIC)
             ?: error("AudioRecord failed for MIC")
-
-        // Route to the Built-In Back Mic, matching VoiceSessionRecorder's routing.
-        // This ensures consistent audio quality (captures both wearer and customer
-        // speech) and avoids potential device contention if both recorders run
-        // simultaneously during live transcription + AR recording.
-        val backMic = findBackMic()
-        if (backMic != null) {
-            val ok = record.setPreferredDevice(backMic)
-            Log.i(TAG, "AR audio encoder setPreferredDevice(backMic id=${backMic.id}) -> $ok")
-        } else {
-            Log.w(TAG, "no Built-In Back Mic found for AR recording — using default input")
-        }
-
         audioRecord = record
 
         val mediaFormat = MediaFormat.createAudioFormat(
@@ -117,17 +97,15 @@ class AudioEncoder(
         codec = MediaCodec.createEncoderByType(MediaFormat.MIMETYPE_AUDIO_AAC).apply {
             configure(mediaFormat, null, null, MediaCodec.CONFIGURE_FLAG_ENCODE)
         }
-        Log.i(TAG, "audio encoder prepared: AAC LC ${sampleRate}Hz mono @ ${bitrate / 1000}kbps")
+        Log.i(TAG, "audio encoder prepared: default MIC QUAD channel 4 -> AAC LC ${sampleRate}Hz mono @ ${bitrate / 1000}kbps, gain=1x")
     }
 
     private fun openAudioRecord(source: Int): AudioRecord? = try {
-        val rec = AudioRecord(
-            source,
-            sampleRate,
-            AudioFormat.CHANNEL_IN_MONO,
-            AudioFormat.ENCODING_PCM_16BIT,
-            pcmReadBufSize,
-        )
+        val rec = AudioRecord.Builder()
+            .setAudioSource(source)
+            .setAudioFormat(RokidMicCapture.audioFormat(sampleRate))
+            .setBufferSizeInBytes(pcmReadBufSize)
+            .build()
         if (rec.state == AudioRecord.STATE_INITIALIZED) {
             Log.i(TAG, "AudioRecord opened: source=$source, sessionId=${rec.audioSessionId}")
             rec
@@ -205,12 +183,22 @@ class AudioEncoder(
         val inBuf: ByteBuffer = c.getInputBuffer(inIdx) ?: return
         inBuf.clear()
 
-        val framesToRead = minOf(pcmTempBuf.size, inBuf.capacity() / 2)
-        val framesRead = if (eos) 0 else rec.read(pcmTempBuf, 0, framesToRead)
-        if (framesRead < 0) {
-            Log.w(TAG, "AudioRecord.read returned $framesRead")
+        val frameCapacity = minOf(
+            pcmTempBuf.size / RokidMicCapture.INPUT_CHANNEL_COUNT,
+            inBuf.capacity() / 2,
+        )
+        val samplesToRead = frameCapacity * RokidMicCapture.INPUT_CHANNEL_COUNT
+        val samplesRead = if (eos) 0 else rec.read(pcmTempBuf, 0, samplesToRead)
+        if (samplesRead < 0) {
+            Log.w(TAG, "AudioRecord.read returned $samplesRead")
             c.queueInputBuffer(inIdx, 0, 0, computePtsUs(), MediaCodec.BUFFER_FLAG_END_OF_STREAM)
             return
+        }
+        val framesRead = samplesRead / RokidMicCapture.INPUT_CHANNEL_COUNT
+
+        if (framesRead > 0 && !routeLogged) {
+            logActualRoute(rec, "AR audio encoder")
+            routeLogged = true
         }
 
         // Track hardware timestamp to measure actual sample rate (HAL may
@@ -234,13 +222,11 @@ class AudioEncoder(
 
         val byteCount = framesRead * 2
         if (byteCount > 0) {
-            // Direct copy with software gain. No resampling - preserve voice quality.
-            for (i in 0 until framesRead) {
-                val sample = pcmTempBuf[i]
-                val boosted = (sample * softwareGain).toInt()
-                    .coerceIn(Short.MIN_VALUE.toInt(), Short.MAX_VALUE.toInt())
-                inBuf.put((boosted and 0xFF).toByte())
-                inBuf.put(((boosted shr 8) and 0xFF).toByte())
+            // Extract the live-auditioned channel unchanged; output stays mono.
+            for (frame in 0 until framesRead) {
+                val sample = RokidMicCapture.selectedSample(pcmTempBuf, frame).toInt()
+                inBuf.put((sample and 0xFF).toByte())
+                inBuf.put(((sample shr 8) and 0xFF).toByte())
             }
         }
 
@@ -322,18 +308,24 @@ class AudioEncoder(
     }
 
     /**
-     * Find the Built-In Back Mic for setPreferredDevice. Mirrors VoiceSessionRecorder's
-     * selection: prefer a BUILTIN_MIC whose product name contains "back", else
-     * the second BUILTIN_MIC entry (the array exposes two devices). Returns null
-     * if none — caller falls back to the default input.
+     * Log the route selected by the audio policy after capture has actually
+     * started. setPreferredDevice() only records a preference; routedDevice is
+     * the source the HAL is really delivering PCM from.
      */
-    private fun findBackMic(): AudioDeviceInfo? {
-        val am = context.getSystemService(AudioManager::class.java) ?: return null
-        val mics = am.getDevices(AudioManager.GET_DEVICES_ALL)
-            .filter { it.isSource && it.type == AudioDeviceInfo.TYPE_BUILTIN_MIC }
-        return mics.firstOrNull { it.productName.contains("back", ignoreCase = true) }
-            ?: mics.getOrNull(1)
-            ?: mics.firstOrNull()
+    private fun logActualRoute(rec: AudioRecord, label: String) {
+        val preferred = rec.preferredDevice
+        val routed = rec.routedDevice
+        if (routed == null) {
+            Log.w(TAG, "$label actual routed device unavailable while recording; preferredId=${preferred?.id}")
+            return
+        }
+        val detail = "$label actual routed device: id=${routed.id}, type=${routed.type}, " +
+            "address=${routed.address}, product=${routed.productName}; preferredId=${preferred?.id}"
+        if (preferred != null && routed.id != preferred.id) {
+            Log.w(TAG, "$detail MISMATCH")
+        } else {
+            Log.i(TAG, detail)
+        }
     }
 
     companion object {

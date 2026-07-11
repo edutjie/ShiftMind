@@ -15,9 +15,9 @@ import kotlin.math.sqrt
 /**
  * TEMP DIAGNOSTIC — delete once the runtime mic config is locked.
  *
- * Rokid "RG-glasses" exposes a 4-mic array (Built-In Mic + Built-In Back Mic +
- * a dedicated "quad mic" input) but runs Qualcomm Fluence beamforming toward the
- * wearer, so the default MIC+MONO capture rejects far-field customer speech.
+ * Rokid "RG-glasses" exposes a 4-mic array through Built-In Mic and Built-In
+ * Back Mic logical routes. Production selection is default MIC + QUAD channel
+ * 4, chosen by live listening with tools/live-mic.sh.
  *
  * This probe opens each candidate AudioRecord config for ~2 s at app start
  * (BEFORE the camera opens — per CLAUDE.md, alternate sources/channel masks must
@@ -188,7 +188,7 @@ class MicConfigProbe(private val context: Context) {
         if (quadCandidates.isNotEmpty()) {
             Log.i(TAG, "QUAD configs with distinct channels: ${quadCandidates.joinToString { "${it.label}(spread=%.1f)".format(it.distinctSpreadDb) }} — preferred if customer sits on a non-dominant channel")
         } else {
-            Log.i(TAG, "no QUAD config returned distinct channels — HAL is duplicating one mic; favor back-mic/single-channel route")
+            Log.i(TAG, "no QUAD config returned distinct channels — HAL is duplicating one mic; audition mono routes with tools/live-mic.sh")
         }
     }
 

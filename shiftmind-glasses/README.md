@@ -1,6 +1,6 @@
 # shiftmind-glasses
 
-Single-module Kotlin/Compose Android app for Rokid AR glasses (`RG-glasses` / Max Pro). Production features: ML Kit on-device face detection with cursor overlap + frontal filtering, Camera2 multi-output recording (cam+audio + HUD), back-mic routing for far-field speech, Doubao streaming ASR, automatic customer session lifecycle, and Q&A mode (swipe-forward gesture) with conversation history for business intelligence queries.
+Single-module Kotlin/Compose Android app for Rokid AR glasses (`RG-glasses` / Max Pro). Production features: ML Kit on-device face detection with cursor overlap + frontal filtering, Camera2 multi-output recording (cam+audio + HUD), four-mic array channel selection for balanced wearer/customer speech, Doubao streaming ASR, automatic customer session lifecycle, and Q&A mode (swipe-forward gesture) with conversation history for business intelligence queries.
 
 ## Prerequisites
 
@@ -124,19 +124,41 @@ Confirm frames land on the server: open `http://localhost:8000/api/preview.html`
 | `net/SessionClient.kt` | OkHttp wrapper for POST `/api/session/{id}/finish`. Uploads WAV audio + optional transcript. |
 | `net/SessionAudioStreamClient.kt` | WebSocket client for live ASR during customer sessions. Streams 16kHz PCM → server → Doubao. |
 | `session/CustomerSessionHolder.kt` | Global customer session state (session_id, customer name, memory card). Polled from server via `/api/session-status`. |
-| `qa/QaController.kt` | Q&A mode state machine (Idle → Recording → Thinking → Answer/Error). Voice capture via back-mic + Doubao streaming ASR. |
+| `qa/QaController.kt` | Q&A mode state machine (Idle → Recording → Thinking → Answer/Error). Voice capture via selected array channel 4 + Doubao streaming ASR. |
 | `qa/QAModeHolder.kt` | Global Q&A mode flag + conversation history (max 20 turns). Clears history on exit. |
 | `qa/QAScreen.kt` | Dedicated AR HUD for Q&A mode with live transcript + short answer display. |
 | `net/QaClient.kt` | OkHttp wrapper for POST `/api/qa/ask`. Sends question + conversation history for contextual follow-ups. |
 | `net/QaAudioStreamClient.kt` | WebSocket client for Q&A voice streaming (decoupled from customer sessions). |
 | `recording/ArRecorder.kt` | Orchestrates cam+audio+HUD recording. Uses Camera2 multi-output session (ImageReader + SurfaceTexture). |
 | `recording/VideoEncoder.kt` | MediaCodec H.264 encoder. Rebases PTS via shared anchor to sync with audio. |
-| `recording/AudioEncoder.kt` | MediaCodec AAC encoder. Uses `AudioSource.MIC` with back-mic routing for far-field speech. |
-| `recording/VoiceSessionRecorder.kt` | Voice capture for customer sessions + Q&A. Routes to back-mic device (id 23) to bypass wearer-facing Fluence beamforming. |
+| `recording/RokidMicCapture.kt` | Shared production configuration: default `AudioSource.MIC`, four-channel input, extract channel 4 to raw 16 kHz mono PCM. |
+| `recording/AudioEncoder.kt` | MediaCodec AAC encoder. Uses `RokidMicCapture` channel 4 with no fixed gain for balanced AR-recording audio. |
+| `recording/VoiceSessionRecorder.kt` | Voice capture for customer sessions + Q&A. Uses the same selected channel 4 for live Doubao ASR and saved WAV audio. |
 | `recording/HudCompositor.kt` | OpenGL ES compositor that reads SurfaceTexture (camera) and renders to encoder surface. `setPtsAnchor()` rebases video PTS to match audio. |
 | `recording/RokidHudRecorder.kt` | Broadcasts to Rokid screenstream service for HUD-only MP4. Requires `intent.setPackage("com.rokid.os.master.screenstream")`. |
 | `recording/MicConfigProbe.kt` | Diagnostic tool (gated by `BuildConfig.AUDIO_PROBE`). Tests multiple AudioSource + channel mask combinations, logs per-config/per-channel dBFS. Runs at app start before Camera2 opens. |
 | `recording/RecordingStateReceiver.kt` | Diagnostic listener for external Rokid `mix_record` and screenstream broadcasts. ShiftMind no longer releases camera for external recorders; it logs conflicts only. |
+
+### Live microphone monitor (debug builds)
+
+Use the laptop-side monitor to audition the Rokid inputs in real time without
+running Camera2, AR recording, or live ASR:
+
+```bash
+cd shiftmind-glasses
+./tools/live-mic.sh back mono
+./tools/live-mic.sh bottom mono
+./tools/live-mic.sh default quad1  # repeat with quad2, quad3, quad4
+```
+
+The script uses `adb reverse` to stream raw 16 kHz mono PCM from the debug-only
+`MicMonitorActivity` into `ffplay` on the laptop. `bottom` targets logical input
+ID 21, `back` targets ID 23, and `quad1`–`quad4` select one channel from the
+four-channel array capture. Set `GAIN_DB=12` only when extra laptop playback
+volume is needed; it does not modify captured samples. Press Ctrl-C to stop.
+
+The production setting selected on the real RG-glasses is `default quad4`.
+Both live ASR and AR recording use that shared configuration.
 
 ## Non-obvious things baked in (don't accidentally undo)
 

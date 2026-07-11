@@ -34,7 +34,7 @@ sealed interface QaUiState {
  *   - touchpad swipe-forward (back→front) → toggleQaMode() (MainActivity side)
  *   - touchpad single-tap            → [onActionKey]: record → stop+send → next
  *
- * Voice: [VoiceSessionRecorder] captures from the back mic and feeds PCM chunks
+ * Voice: [VoiceSessionRecorder] captures selected array channel 4 and feeds PCM chunks
  * to [QaAudioStreamClient] (Doubao streaming), which returns a live transcript
  * shown on the HUD. On stop, the final transcript is POSTed to /api/qa/ask.
  */
