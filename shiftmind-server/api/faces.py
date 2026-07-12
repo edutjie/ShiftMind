@@ -84,7 +84,7 @@ svg{{width:100%;max-width:620px;height:auto;border:1px solid #063;background:#00
 </style></head>
 <body>
 <h2>ShiftMind faces</h2>
-<p><a href="/api/preview.html">preview</a> · <a href="/api/preview-status">status json</a></p>
+<p><a href="/api/preview.html">preview</a> · <a href="/api/qa.html">Q&A</a> · <a href="/api/preview-status">status json</a></p>
 <main>
   <section>
     <h3>latest crop</h3>

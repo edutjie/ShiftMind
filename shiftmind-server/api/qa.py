@@ -314,7 +314,7 @@ semantic memory, then answers with sources.</p>
   <p class="muted">spoken on the glasses &rarr; full answer here. auto-refreshes every 4s.</p>
   <div id="glasses-log"><p class="muted">none yet</p></div>
 </div>
-<p class="muted"><a href="/api/preview.html">preview</a> · <a href="/api/faces.html">faces debug</a></p>
+<p class="muted"><a href="/api/preview.html">preview</a> · <a href="/api/faces.html">faces debug</a> · <a href="/api/qa.html">Q&A</a></p>
 
 <script>
 const chips = document.getElementById("chips");

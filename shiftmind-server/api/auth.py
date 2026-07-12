@@ -123,7 +123,7 @@ button{{cursor:pointer;margin-top:6px}} label{{display:block;margin-top:8px;colo
 </style></head>
 <body>
 <h2>ShiftMind — employee login</h2>
-<p><a href="/api/preview.html">preview</a> · <a href="/api/faces.html">faces</a> · <a href="/api/whoami">whoami json</a></p>
+<p><a href="/api/preview.html">preview</a> · <a href="/api/faces.html">faces</a> · <a href="/api/qa.html">Q&A</a> · <a href="/api/whoami">whoami json</a></p>
 <section>
   <h3>Current shift</h3>
   {status}

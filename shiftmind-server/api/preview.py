@@ -494,7 +494,7 @@ img{max-width:100%;height:auto;border:1px solid #0f0}
     </div>
   </section>
 </main>
-<p><a href="/api/preview">raw preview</a> · <a href="/api/faces.html">faces debug</a> · POST JPEGs to <code>/api/preview-frame</code> and HUD JSON to <code>/api/hud-state</code>.</p>
+<p><a href="/api/qa.html">Q&A</a> · <a href="/api/preview">raw preview</a> · <a href="/api/faces.html">faces debug</a> · POST JPEGs to <code>/api/preview-frame</code> and HUD JSON to <code>/api/hud-state</code>.</p>
 <script>
 function esc(s){return String(s||"").replace(/[&<>]/g,c=>({"&":"&amp;","<":"&lt;",">":"&gt;"}[c]));}
 async function refreshSession(){
