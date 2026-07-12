@@ -15,7 +15,6 @@ session_memory_service client for embeddings/vector search.
 """
 from __future__ import annotations
 
-import collections
 import datetime
 import json
 import logging
@@ -36,10 +35,10 @@ _QA_TABLES = {"customer_sessions", "customers", "employees", "locations", "json_
 
 logger = logging.getLogger("shiftmind.qa")
 
-# In-memory ring buffer of recent glasses-side Q&A turns, surfaced via
-# GET /api/qa/last-glasses and the /api/qa.html "recent glasses questions"
-# panel. Lost on restart — acceptable for a developer-facing display.
-_GLASSES_QA_LOG: collections.deque = collections.deque(maxlen=50)
+# Glasses-side Q&A turns are persisted to the `qa_turns` SQLite table (see
+# storage.insert_qa_turn / recent_qa_turns) so history survives server restarts.
+# Surfaced via GET /api/qa/last-glasses and the /api/qa.html "recent glasses
+# questions" panel.
 
 # Keywords that have no business in a read-only SELECT. Belt-and-suspenders
 # on top of the driver-level mode=ro connection.
@@ -885,30 +884,55 @@ def answer_question_from_audio(
 def _log_glasses_qa(
     question: str, result: dict[str, Any], employee_id: str | None
 ) -> None:
-    """Server-side full-answer channel: uvicorn console log + in-memory ring."""
+    """Server-side full-answer channel: uvicorn console log + SQLite persist."""
+    log_glasses_qa(question, result, employee_id)
+
+
+def log_glasses_qa(
+    question: str, result: dict[str, Any], employee_id: str | None
+) -> None:
+    """Persist a glasses Q&A turn: uvicorn console log + the qa_turns table.
+
+    Used by both the WAV path (answer_question_from_audio) and the streaming-ASR
+    path (/api/qa/ask with an OkHttp User-Agent). Persistence is best-effort —
+    a DB error must not break the answer returned to the glasses.
+    """
     answer = result.get("answer", "")
     short = result.get("short_answer", "")
+    ts = datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
     logger.info(
         "[glasses-qa] employee=%s | Q: %s | A: %s | short: %s",
         employee_id, question, answer, short,
     )
-    _GLASSES_QA_LOG.append({
-        "ts": datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
-        "employee_id": employee_id,
-        "question": question,
-        "answer": answer,
-        "short_answer": short,
-        "elapsed_ms": result.get("elapsed_ms"),
-        "iterations": result.get("iterations"),
-    })
+    try:
+        storage.insert_qa_turn(
+            ts=ts,
+            employee_id=employee_id,
+            question=question,
+            answer=answer,
+            short_answer=short,
+            elapsed_ms=result.get("elapsed_ms"),
+            iterations=result.get("iterations"),
+        )
+    except sqlite3.Error as exc:
+        logger.warning("[glasses-qa] failed to persist turn: %s", exc)
 
 
 def recent_glasses_qa(limit: int = 20) -> list[dict[str, Any]]:
-    """Newest-first snapshot of recent glasses Q&A turns (in-memory only)."""
-    items = list(_GLASSES_QA_LOG)
-    if limit and limit > 0:
-        items = items[-limit:]
-    return list(reversed(items))
+    """Newest-first snapshot of recent glasses Q&A turns (persisted)."""
+    rows = storage.recent_qa_turns(limit)
+    return [
+        {
+            "ts": row["ts"],
+            "employee_id": row["employee_id"],
+            "question": row["question"],
+            "answer": row["answer"],
+            "short_answer": row["short_answer"],
+            "elapsed_ms": row["elapsed_ms"],
+            "iterations": row["iterations"],
+        }
+        for row in rows
+    ]
 
 
 def _empty_trace() -> dict[str, Any]:
