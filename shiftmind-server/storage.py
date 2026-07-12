@@ -97,6 +97,17 @@ class Storage:
                     home_location_id TEXT REFERENCES locations(id),
                     created_at TEXT NOT NULL
                 );
+
+                CREATE TABLE IF NOT EXISTS qa_turns (
+                    id TEXT PRIMARY KEY,
+                    ts TEXT NOT NULL,
+                    employee_id TEXT,
+                    question TEXT NOT NULL,
+                    answer TEXT NOT NULL DEFAULT '',
+                    short_answer TEXT NOT NULL DEFAULT '',
+                    elapsed_ms INTEGER,
+                    iterations INTEGER
+                );
                 """
             )
         self._migrate_add_employee_location_columns()
@@ -497,6 +508,40 @@ class Storage:
             "home_location_id": home_location_id,
             "created_at": now,
         }
+
+    def insert_qa_turn(
+        self,
+        *,
+        ts: str,
+        employee_id: str | None,
+        question: str,
+        answer: str,
+        short_answer: str,
+        elapsed_ms: int | None,
+        iterations: int | None,
+    ) -> None:
+        """Persist one glasses Q&A turn so history survives server restarts."""
+        qid = _next_sequential_id(self, "qa_turns", "qa")
+        with self.connect() as conn:
+            conn.execute(
+                "INSERT INTO qa_turns "
+                "(id, ts, employee_id, question, answer, short_answer, elapsed_ms, iterations) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                (qid, ts, employee_id, question, answer, short_answer, elapsed_ms, iterations),
+            )
+
+    def recent_qa_turns(self, limit: int = 20) -> list[sqlite3.Row]:
+        """Newest-first Q&A turns. Orders by rowid (insertion order) for stability."""
+        sql = (
+            "SELECT ts, employee_id, question, answer, short_answer, elapsed_ms, iterations "
+            "FROM qa_turns ORDER BY rowid DESC"
+        )
+        params: tuple = ()
+        if limit and limit > 0:
+            sql += " LIMIT ?"
+            params = (limit,)
+        with self.connect() as conn:
+            return conn.execute(sql, params).fetchall()
 
 
 def _next_sequential_id(storage: "Storage", table: str, prefix: str) -> str:

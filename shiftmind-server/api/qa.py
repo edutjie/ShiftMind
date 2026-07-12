@@ -10,7 +10,7 @@ import asyncio
 import contextlib
 import json
 
-from fastapi import APIRouter, File, HTTPException, UploadFile, WebSocket, WebSocketDisconnect
+from fastapi import APIRouter, File, HTTPException, Request, UploadFile, WebSocket, WebSocketDisconnect
 from fastapi.responses import HTMLResponse
 from pydantic import BaseModel
 
@@ -59,7 +59,7 @@ async def filter_options() -> dict:
 
 
 @router.post("/api/qa/ask")
-async def ask(payload: AskPayload) -> dict:
+async def ask(payload: AskPayload, request: Request) -> dict:
     question = payload.question.strip()
     if not question:
         raise HTTPException(status_code=400, detail="question must not be empty")
@@ -67,13 +67,22 @@ async def ask(payload: AskPayload) -> dict:
     login = active_login.read()
     filters = payload.filters.model_dump() if payload.filters else None
     history = [t.model_dump() for t in payload.history] if payload.history else None
-    return await asyncio.to_thread(
+    employee_id = login.employee_id if login else None
+    result = await asyncio.to_thread(
         qa_service.answer_question,
         question,
-        employee_id=login.employee_id if login else None,
+        employee_id=employee_id,
         filters=filters,
         history=history,
     )
+    # Streaming-ASR path: the glasses transcribe over /api/qa/audio-stream then
+    # POST the text here. That path bypasses answer_question_from_audio, so the
+    # "recent glasses questions" feed never updates. Detect glasses origin by the
+    # OkHttp User-Agent (the browser Q&A page never sends it) and log explicitly.
+    user_agent = request.headers.get("user-agent", "")
+    if "okhttp" in user_agent.lower():
+        qa_service.log_glasses_qa(question, result, employee_id)
+    return result
 
 
 @router.post("/api/qa/ask-audio")
