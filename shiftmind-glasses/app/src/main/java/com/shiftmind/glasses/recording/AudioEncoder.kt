@@ -1,336 +1,344 @@
 package com.shiftmind.glasses.recording
 
-import android.media.AudioFormat
-import android.media.AudioRecord
-import android.media.AudioTimestamp
 import android.media.MediaCodec
 import android.media.MediaCodecInfo
 import android.media.MediaFormat
-import android.media.MediaRecorder
 import android.os.Handler
 import android.os.HandlerThread
 import android.util.Log
 import java.nio.ByteBuffer
+import java.util.concurrent.ArrayBlockingQueue
+import java.util.concurrent.atomic.AtomicLong
 
 /**
- * AudioRecord → MediaCodec AAC LC encoder → [RecordingMuxer].
+ * Shared PCM → MediaCodec AAC LC encoder → [RecordingMuxer].
  *
- * Configuration (defaults):
- *   - 16 kHz mono 16-bit PCM (Whisper-friendly, matches the typical AR
- *     glasses single-mic capture).
- *   - AAC LC @ 48 kbps in MP4 container.
- *
- * Threading: PCM capture + codec drain share a single [HandlerThread]
- * (`shiftmind-aenc`). Each loop iteration:
- *   1. Dequeue input buffer, blocking read PCM from AudioRecord into it,
- *      `queueInputBuffer` with monotonic PTS.
- *   2. Drain output buffers (non-blocking) — write samples to muxer.
- *   3. Re-post self.
- *
- * PTS: derived from cumulative sample count, not wall-clock — keeps audio
- * monotonic and prevents the first blocking AudioRecord.read() from pushing
- * the whole audio track later in the MP4 timeline.
+ * [SharedMicCapture] owns the single hardware AudioRecord. This encoder only
+ * consumes its mono chunks on a private bounded queue, so codec back-pressure
+ * can never delay a microphone read or steal input from live ASR.
  */
 class AudioEncoder(
     private val muxer: RecordingMuxer,
+    private val micCapture: SharedMicCapture,
     private val sampleRate: Int = 16_000,
     private val bitrate: Int = 48_000,
 ) {
-
-    private var audioRecord: AudioRecord? = null
     private var codec: MediaCodec? = null
     private var trackIndex: Int = -1
+    private var subscription: SharedMicCapture.Subscription? = null
 
     private val thread = HandlerThread("shiftmind-aenc")
     private lateinit var handler: Handler
-
     private val bufferInfo = MediaCodec.BufferInfo()
+    private val pendingChunks = ArrayBlockingQueue<SharedMicCapture.Chunk>(MAX_PENDING_CHUNKS)
+    private var pendingInput: SharedMicCapture.Chunk? = null
+    private val droppedChunks = AtomicLong(0)
 
     @Volatile private var running = false
+    @Volatile private var accepting = false
     @Volatile private var stopRequested = false
     @Volatile private var draining = false
-    private var routeLogged = false
+    private var eosQueued = false
 
-    private var totalFramesRead: Long = 0L
-    // Shared CLOCK_MONOTONIC anchor for A/V sync.
-    private var recordingStartNs: Long = 0L
-    // Hardware timestamp tracking to avoid discontinuity when HW ts becomes available.
-    private val audioTimestamp = AudioTimestamp()
-    private var firstHwTimestampNs: Long = 0L
-    private var framesAtFirstHwTimestamp: Long = 0L
-    // PTS offset to apply when transitioning from fallback to HW timestamp.
-    private var ptsOffsetUs: Long = 0L
+    private var totalFramesRead = 0L
+    private var recordingStartNs = 0L
+    private var firstHwTimestampNs = 0L
+    private var framesAtFirstHwTimestamp = 0L
+    private var lastHwTimestampNs = 0L
+    private var lastHwFramePosition = 0L
+    private var ptsOffsetUs = 0L
+    private var lastPtsUs = 0L
 
-    private val pcmReadBufSize: Int
-    private val pcmTempBuf: ShortArray
-
-    init {
-        val minBuf = AudioRecord.getMinBufferSize(
-            sampleRate, RokidMicCapture.channelMask, AudioFormat.ENCODING_PCM_16BIT,
-        )
-        require(minBuf > 0) { "AudioRecord.getMinBufferSize failed: $minBuf" }
-        // Oversize the AudioRecord internal buffer so blocking reads don't
-        // drop samples if drain stalls briefly.
-        pcmReadBufSize = maxOf(
-            minBuf * 4,
-            sampleRate / 4 * RokidMicCapture.INPUT_CHANNEL_COUNT * 2,
-        ) // ~250 ms of four-channel PCM
-        pcmTempBuf = ShortArray(RokidMicCapture.FRAMES_PER_CHUNK * RokidMicCapture.INPUT_CHANNEL_COUNT)
-    }
-
-    /** Build AudioRecord + codec. Call before [start]. */
+    /** Configure the codec. The microphone subscription begins in [start]. */
     fun prepare() {
-        routeLogged = false
-        // Match VoiceSessionRecorder exactly: default MIC, QUAD capture, select
-        // channel 4, emit mono. No preferred-device override and no fixed gain.
-        val record = openAudioRecord(MediaRecorder.AudioSource.MIC)
-            ?: error("AudioRecord failed for MIC")
-        audioRecord = record
-
+        check(codec == null) { "audio encoder already prepared" }
         val mediaFormat = MediaFormat.createAudioFormat(
-            MediaFormat.MIMETYPE_AUDIO_AAC, sampleRate, /* channels= */ 1,
+            MediaFormat.MIMETYPE_AUDIO_AAC,
+            sampleRate,
+            /* channels= */ 1,
         ).apply {
             setInteger(MediaFormat.KEY_AAC_PROFILE, MediaCodecInfo.CodecProfileLevel.AACObjectLC)
             setInteger(MediaFormat.KEY_BIT_RATE, bitrate)
-            setInteger(MediaFormat.KEY_MAX_INPUT_SIZE, 16384)
+            setInteger(MediaFormat.KEY_MAX_INPUT_SIZE, 16_384)
         }
         codec = MediaCodec.createEncoderByType(MediaFormat.MIMETYPE_AUDIO_AAC).apply {
             configure(mediaFormat, null, null, MediaCodec.CONFIGURE_FLAG_ENCODE)
         }
-        Log.i(TAG, "audio encoder prepared: default MIC QUAD channel 4 -> AAC LC ${sampleRate}Hz mono @ ${bitrate / 1000}kbps, gain=1x")
+        Log.i(TAG, "audio encoder prepared: shared MIC -> AAC LC ${sampleRate}Hz mono @ ${bitrate / 1000}kbps")
     }
 
-    private fun openAudioRecord(source: Int): AudioRecord? = try {
-        val rec = AudioRecord.Builder()
-            .setAudioSource(source)
-            .setAudioFormat(RokidMicCapture.audioFormat(sampleRate))
-            .setBufferSizeInBytes(pcmReadBufSize)
-            .build()
-        if (rec.state == AudioRecord.STATE_INITIALIZED) {
-            Log.i(TAG, "AudioRecord opened: source=$source, sessionId=${rec.audioSessionId}")
-            rec
-        } else {
-            Log.w(TAG, "AudioRecord source=$source init failed (state=${rec.state})")
-            try { rec.release() } catch (_: Throwable) {}
-            null
-        }
-    } catch (t: Throwable) {
-        Log.w(TAG, "AudioRecord source=$source threw", t)
-        null
-    }
-
+    /** Start the codec and subscribe to the single shared microphone stream. */
     fun start(startEpochNs: Long = System.nanoTime()) {
-        check(codec != null && audioRecord != null) { "call prepare() first" }
-        recordingStartNs = startEpochNs
-        codec!!.start()
-        audioRecord!!.startRecording()
+        check(codec != null) { "call prepare() first" }
+        check(!running) { "audio encoder already started" }
+
+        resetForStart(startEpochNs)
+        val activeCodec = codec ?: error("codec disappeared before start")
+        activeCodec.start()
         running = true
+        accepting = true
         draining = true
         thread.start()
         handler = Handler(thread.looper)
+
+        val newSubscription = micCapture.subscribe("AR AAC") { chunk ->
+            offerChunk(chunk)
+        }
+        if (newSubscription == null) {
+            accepting = false
+            running = false
+            draining = false
+            teardown()
+            error("shared microphone unavailable for AR recording")
+        }
+        subscription = newSubscription
         handler.post(::pumpLoop)
+        Log.i(TAG, "audio encoder subscribed to shared mic")
     }
 
-    /** Signal EOS, wait for drain, tear down. */
-    fun stop(timeoutMs: Long = 2000) {
-        if (!running) return
+    /** Stop input first, drain all accepted PCM, then signal AAC EOS. */
+    fun stop(timeoutMs: Long = STOP_TIMEOUT_MS) {
+        if (codec == null) return
+
+        accepting = false
+        subscription?.close()
+        subscription = null
         stopRequested = true
-        // Log measured sample rate if hardware timestamps available
-        if (firstHwTimestampNs > 0L && audioTimestamp.framePosition > 0) {
-            val elapsedNs = audioTimestamp.nanoTime - firstHwTimestampNs
-            val capturedFrames = audioTimestamp.framePosition - framesAtFirstHwTimestamp
-            if (elapsedNs > 0L) {
-                val measuredRate = capturedFrames * 1_000_000_000L / elapsedNs
-                Log.i(TAG, "measured sample rate: ${measuredRate}Hz (declared ${sampleRate}Hz), captured ${capturedFrames}fr over ${elapsedNs / 1_000_000}ms")
-            }
-        }
-        // Wait for the pump loop to push EOS through codec and drain.
+        if (::handler.isInitialized && draining) handler.post(::pumpLoop)
+
         val deadline = System.nanoTime() + timeoutMs * 1_000_000L
         while (draining && System.nanoTime() < deadline) {
-            try { Thread.sleep(20) } catch (_: InterruptedException) { break }
+            try {
+                Thread.sleep(STOP_WAIT_INTERVAL_MS)
+            } catch (_: InterruptedException) {
+                break
+            }
         }
         if (draining) Log.w(TAG, "audio drain did not finish within ${timeoutMs}ms")
+        logMeasuredRate()
         teardown()
     }
 
-    /** Capture + drain. Re-posts self until stopRequested + EOS sent + drained. */
+    /**
+     * Drains at most one PCM block per short tick. Both input and output codec
+     * dequeues are non-blocking, so this thread never competes with the source
+     * thread's READ_BLOCKING cadence.
+     */
     private fun pumpLoop() {
         try {
-            if (running && !stopRequested) {
-                feedInput(eos = false)
-            } else if (running) {
-                // First post after stop — feed the EOS marker, then continue draining.
-                feedInput(eos = true)
-                running = false
+            val input = pendingInput ?: pendingChunks.poll()
+            if (input != null) {
+                if (feedInput(input)) {
+                    pendingInput = null
+                } else {
+                    pendingInput = input
+                }
+            } else if (stopRequested && !eosQueued) {
+                queueEndOfStream()
             }
+
             drainOutput()
             if (draining) {
-                // AudioRecord.read() is blocking, so no artificial delay is
-                // needed here. A delay changes the observed capture cadence.
-                handler.post(::pumpLoop)
+                handler.postDelayed(::pumpLoop, PUMP_INTERVAL_MS)
             }
         } catch (t: Throwable) {
-            Log.e(TAG, "audio pump loop crashed", t)
+            Log.e(TAG, "audio encoder pump loop crashed", t)
             draining = false
         }
     }
 
-    private fun feedInput(eos: Boolean) {
-        val c = codec ?: return
-        val rec = audioRecord ?: return
-        val inIdx = c.dequeueInputBuffer(INPUT_DEQUEUE_TIMEOUT_US)
-        if (inIdx < 0) return
-        val inBuf: ByteBuffer = c.getInputBuffer(inIdx) ?: return
-        inBuf.clear()
-
-        val frameCapacity = minOf(
-            pcmTempBuf.size / RokidMicCapture.INPUT_CHANNEL_COUNT,
-            inBuf.capacity() / 2,
-        )
-        val samplesToRead = frameCapacity * RokidMicCapture.INPUT_CHANNEL_COUNT
-        val samplesRead = if (eos) 0 else rec.read(pcmTempBuf, 0, samplesToRead)
-        if (samplesRead < 0) {
-            Log.w(TAG, "AudioRecord.read returned $samplesRead")
-            c.queueInputBuffer(inIdx, 0, 0, computePtsUs(), MediaCodec.BUFFER_FLAG_END_OF_STREAM)
-            return
-        }
-        val framesRead = samplesRead / RokidMicCapture.INPUT_CHANNEL_COUNT
-
-        if (framesRead > 0 && !routeLogged) {
-            logActualRoute(rec, "AR audio encoder")
-            routeLogged = true
-        }
-
-        // Track hardware timestamp to measure actual sample rate (HAL may
-        // deliver faster than declared 16kHz). Use for PTS, not resampling.
-        if (!eos && framesRead > 0) {
-            val tsOk = rec.getTimestamp(audioTimestamp, AudioTimestamp.TIMEBASE_MONOTONIC)
-            if (tsOk == AudioRecord.SUCCESS && audioTimestamp.framePosition > 0 && audioTimestamp.nanoTime > 0) {
-                if (firstHwTimestampNs == 0L) {
-                    // First valid HW timestamp - capture the offset between fallback
-                    // PTS (sample-based) and HW timestamp to avoid discontinuity.
-                    val fallbackPtsUs = totalFramesRead * 1_000_000L / sampleRate
-                    val hwPtsUs = (audioTimestamp.nanoTime - recordingStartNs) / 1_000L
-                    ptsOffsetUs = fallbackPtsUs - hwPtsUs
-
-                    firstHwTimestampNs = audioTimestamp.nanoTime
-                    framesAtFirstHwTimestamp = audioTimestamp.framePosition
-                    Log.d(TAG, "first HW ts: ${audioTimestamp.nanoTime}ns @ frame ${audioTimestamp.framePosition}, ptsOffset=${ptsOffsetUs}us")
-                }
+    /** Offer only; this runs on SharedMicCapture's real-time source thread. */
+    private fun offerChunk(chunk: SharedMicCapture.Chunk) {
+        if (!accepting) return
+        if (!pendingChunks.offer(chunk)) {
+            val dropped = droppedChunks.incrementAndGet()
+            if (dropped == 1L || dropped % DROP_LOG_EVERY == 0L) {
+                Log.w(
+                    TAG,
+                    "AAC queue full: dropped=$dropped at shared seq=${chunk.sequence} " +
+                        "(capacity=$MAX_PENDING_CHUNKS)",
+                )
             }
         }
+    }
 
-        val byteCount = framesRead * 2
-        if (byteCount > 0) {
-            // Extract the live-auditioned channel unchanged; output stays mono.
-            for (frame in 0 until framesRead) {
-                val sample = RokidMicCapture.selectedSample(pcmTempBuf, frame).toInt()
-                inBuf.put((sample and 0xFF).toByte())
-                inBuf.put(((sample shr 8) and 0xFF).toByte())
-            }
+    /** Queue one source-timestamped PCM chunk, returning false if codec input is busy. */
+    private fun feedInput(chunk: SharedMicCapture.Chunk): Boolean {
+        val activeCodec = codec ?: return false
+        val inputIndex = activeCodec.dequeueInputBuffer(NO_WAIT_US)
+        if (inputIndex < 0) return false
+        val inputBuffer: ByteBuffer = activeCodec.getInputBuffer(inputIndex)
+            ?: error("getInputBuffer($inputIndex) returned null")
+        inputBuffer.clear()
+        check(chunk.pcm.size <= inputBuffer.remaining()) {
+            "AAC input buffer too small (${inputBuffer.remaining()} < ${chunk.pcm.size})"
         }
+        inputBuffer.put(chunk.pcm)
 
-        val ptsUs = computePtsUs()
+        val framesRead = chunk.pcm.size / BYTES_PER_SAMPLE
+        val hasHardwareTimestamp = observeHardwareTimestamp(chunk)
+        val ptsUs = computePtsUs(hasHardwareTimestamp)
         totalFramesRead += framesRead.toLong()
-        val flags = if (eos) MediaCodec.BUFFER_FLAG_END_OF_STREAM else 0
-        c.queueInputBuffer(inIdx, 0, byteCount, ptsUs, flags)
+        lastPtsUs = ptsUs
+        activeCodec.queueInputBuffer(inputIndex, 0, chunk.pcm.size, ptsUs, 0)
+        return true
     }
 
-    private fun computePtsUs(): Long {
-        // CRITICAL: Rokid hardware captures at ~15,150Hz (measured), NOT 16,000Hz
-        // (declared). Using sample-count-based PTS causes 5.6% speed-up because:
-        //   - Capture 15,150 samples in 1 real second
-        //   - Label as 16kHz → player thinks they span 15,150/16,000 = 0.947s
-        //   - Audio plays 5.6% faster than real-time
-        //
-        // Solution: Use hardware timestamps (AudioRecord.getTimestamp()) which
-        // reflect true CLOCK_MONOTONIC capture time. Anchor to the same epoch as
-        // video (recordingStartNs from System.nanoTime()) for A/V sync.
-        //
-        // To avoid discontinuity when HW timestamp becomes available (~320 frames,
-        // ~30s into recording), we compute ptsOffsetUs at transition time to ensure
-        // smooth handoff from fallback (sample-based) to HW timestamp.
-        if (audioTimestamp.framePosition > 0 && audioTimestamp.nanoTime > 0) {
-            // HW timestamp is valid - use it (ground truth) + offset for continuity.
-            return (audioTimestamp.nanoTime - recordingStartNs) / 1_000L + ptsOffsetUs
+    private fun queueEndOfStream() {
+        val activeCodec = codec ?: return
+        val inputIndex = activeCodec.dequeueInputBuffer(NO_WAIT_US)
+        if (inputIndex < 0) return
+        activeCodec.queueInputBuffer(
+            inputIndex,
+            0,
+            0,
+            lastPtsUs,
+            MediaCodec.BUFFER_FLAG_END_OF_STREAM,
+        )
+        eosQueued = true
+        running = false
+    }
+
+    /**
+     * Preserve the earlier A/V calibration: use source hardware timestamps
+     * when available, while retaining a sample-clock fallback and a smooth
+     * transition between the two. The timestamp travels with PCM, rather than
+     * being sampled late after codec backlog has developed.
+     */
+    private fun observeHardwareTimestamp(chunk: SharedMicCapture.Chunk): Boolean {
+        val timestampNs = chunk.captureTimestampNs ?: return false
+        val framePosition = chunk.captureFramePosition ?: return false
+        if (firstHwTimestampNs == 0L) {
+            val fallbackPtsUs = totalFramesRead * 1_000_000L / sampleRate
+            val hardwarePtsUs = (timestampNs - recordingStartNs) / 1_000L
+            ptsOffsetUs = fallbackPtsUs - hardwarePtsUs
+            firstHwTimestampNs = timestampNs
+            framesAtFirstHwTimestamp = framePosition
+            Log.d(
+                TAG,
+                "first shared HW ts: ${timestampNs}ns @ frame $framePosition, ptsOffset=${ptsOffsetUs}us",
+            )
         }
-        // HW timestamp not yet available - temporary fallback.
-        return totalFramesRead * 1_000_000L / sampleRate
+        lastHwTimestampNs = timestampNs
+        lastHwFramePosition = framePosition
+        return true
     }
 
+    private fun computePtsUs(hasHardwareTimestamp: Boolean): Long {
+        // Never reuse a timestamp from a preceding chunk. A failed timestamp
+        // read must fall back to the sample clock rather than queuing repeated
+        // PTS values (which players render as a burst or a gap).
+        val calculated = if (hasHardwareTimestamp) {
+            ((lastHwTimestampNs - recordingStartNs) / 1_000L + ptsOffsetUs).coerceAtLeast(0L)
+        } else {
+            totalFramesRead * 1_000_000L / sampleRate
+        }
+        return maxOf(lastPtsUs, calculated)
+    }
+
+    /** Drain only ready output; waiting here would make capture queues overflow. */
     private fun drainOutput() {
-        val c = codec ?: return
+        val activeCodec = codec ?: return
         while (true) {
-            val outIdx = c.dequeueOutputBuffer(bufferInfo, DEQUEUE_TIMEOUT_US)
+            val outputIndex = activeCodec.dequeueOutputBuffer(bufferInfo, NO_WAIT_US)
             when {
-                outIdx == MediaCodec.INFO_TRY_AGAIN_LATER -> return
-                outIdx == MediaCodec.INFO_OUTPUT_FORMAT_CHANGED -> {
-                    if (trackIndex < 0) {
-                        trackIndex = muxer.addAudioTrack(c.outputFormat)
-                    }
+                outputIndex == MediaCodec.INFO_TRY_AGAIN_LATER -> return
+                outputIndex == MediaCodec.INFO_OUTPUT_FORMAT_CHANGED -> {
+                    if (trackIndex < 0) trackIndex = muxer.addAudioTrack(activeCodec.outputFormat)
                 }
-                outIdx >= 0 -> {
-                    val outBuf = c.getOutputBuffer(outIdx)
-                        ?: error("getOutputBuffer($outIdx) returned null")
+                outputIndex >= 0 -> {
+                    val outputBuffer = activeCodec.getOutputBuffer(outputIndex)
+                        ?: error("getOutputBuffer($outputIndex) returned null")
                     if ((bufferInfo.flags and MediaCodec.BUFFER_FLAG_CODEC_CONFIG) != 0) {
-                        // CSD captured via INFO_OUTPUT_FORMAT_CHANGED — drop here.
                         bufferInfo.size = 0
                     }
-                    if (bufferInfo.size > 0 && muxer.isStarted) {
-                        outBuf.position(bufferInfo.offset)
-                        outBuf.limit(bufferInfo.offset + bufferInfo.size)
-                        muxer.writeAudio(outBuf, bufferInfo)
+                    if (bufferInfo.size > 0) {
+                        outputBuffer.position(bufferInfo.offset)
+                        outputBuffer.limit(bufferInfo.offset + bufferInfo.size)
+                        // RecordingMuxer buffers this until the video format
+                        // arrives, so do not discard the opening AAC frames.
+                        muxer.writeAudio(outputBuffer, bufferInfo)
                     }
-                    c.releaseOutputBuffer(outIdx, false)
+                    activeCodec.releaseOutputBuffer(outputIndex, false)
                     if ((bufferInfo.flags and MediaCodec.BUFFER_FLAG_END_OF_STREAM) != 0) {
                         Log.i(TAG, "audio encoder reported EOS")
                         draining = false
                         return
                     }
                 }
-                else -> Log.w(TAG, "unexpected dequeueOutputBuffer: $outIdx")
+                else -> Log.w(TAG, "unexpected dequeueOutputBuffer: $outputIndex")
             }
         }
     }
 
-    private fun teardown() {
-        try { audioRecord?.stop() } catch (_: Throwable) {}
-        try { audioRecord?.release() } catch (_: Throwable) {}
-        audioRecord = null
-        try { codec?.stop() } catch (_: Throwable) {}
-        try { codec?.release() } catch (_: Throwable) {}
-        codec = null
-        try {
-            thread.quitSafely()
-            thread.join(500)
-        } catch (_: InterruptedException) {}
-        Log.i(TAG, "audio encoder torn down")
+    private fun resetForStart(startEpochNs: Long) {
+        pendingChunks.clear()
+        pendingInput = null
+        droppedChunks.set(0)
+        trackIndex = -1
+        recordingStartNs = startEpochNs
+        totalFramesRead = 0L
+        firstHwTimestampNs = 0L
+        framesAtFirstHwTimestamp = 0L
+        lastHwTimestampNs = 0L
+        lastHwFramePosition = 0L
+        ptsOffsetUs = 0L
+        lastPtsUs = 0L
+        eosQueued = false
+        stopRequested = false
     }
 
-    /**
-     * Log the route selected by the audio policy after capture has actually
-     * started. setPreferredDevice() only records a preference; routedDevice is
-     * the source the HAL is really delivering PCM from.
-     */
-    private fun logActualRoute(rec: AudioRecord, label: String) {
-        val preferred = rec.preferredDevice
-        val routed = rec.routedDevice
-        if (routed == null) {
-            Log.w(TAG, "$label actual routed device unavailable while recording; preferredId=${preferred?.id}")
-            return
+    private fun logMeasuredRate() {
+        if (firstHwTimestampNs <= 0L || lastHwTimestampNs <= firstHwTimestampNs) return
+        val elapsedNs = lastHwTimestampNs - firstHwTimestampNs
+        val capturedFrames = lastHwFramePosition - framesAtFirstHwTimestamp
+        if (capturedFrames <= 0L) return
+        val measuredRate = capturedFrames * 1_000_000_000L / elapsedNs
+        Log.i(
+            TAG,
+            "shared mic measured sample rate: ${measuredRate}Hz (declared ${sampleRate}Hz), " +
+                "captured ${capturedFrames}fr over ${elapsedNs / 1_000_000}ms, " +
+                "queuedDrops=${droppedChunks.get()}",
+        )
+    }
+
+    private fun teardown() {
+        accepting = false
+        subscription?.close()
+        subscription = null
+        pendingChunks.clear()
+        pendingInput = null
+        if (::handler.isInitialized) handler.removeCallbacksAndMessages(null)
+        if (thread.isAlive) {
+            thread.quitSafely()
+            try {
+                thread.join(THREAD_JOIN_TIMEOUT_MS)
+            } catch (_: InterruptedException) {
+            }
         }
-        val detail = "$label actual routed device: id=${routed.id}, type=${routed.type}, " +
-            "address=${routed.address}, product=${routed.productName}; preferredId=${preferred?.id}"
-        if (preferred != null && routed.id != preferred.id) {
-            Log.w(TAG, "$detail MISMATCH")
-        } else {
-            Log.i(TAG, detail)
+        try {
+            codec?.stop()
+        } catch (_: Throwable) {
         }
+        try {
+            codec?.release()
+        } catch (_: Throwable) {
+        }
+        codec = null
+        running = false
+        draining = false
+        Log.i(TAG, "audio encoder torn down")
     }
 
     companion object {
         private const val TAG = "ShiftMind.AEnc"
-        private const val INPUT_DEQUEUE_TIMEOUT_US = 10_000L
-        private const val DEQUEUE_TIMEOUT_US = 10_000L
+        private const val BYTES_PER_SAMPLE = 2
+        private const val MAX_PENDING_CHUNKS = 100 // ~2 seconds at 20 ms/chunk
+        private const val NO_WAIT_US = 0L
+        private const val PUMP_INTERVAL_MS = 5L
+        private const val STOP_TIMEOUT_MS = 2_000L
+        private const val STOP_WAIT_INTERVAL_MS = 20L
+        private const val THREAD_JOIN_TIMEOUT_MS = 500L
+        private const val DROP_LOG_EVERY = 25L
     }
 }

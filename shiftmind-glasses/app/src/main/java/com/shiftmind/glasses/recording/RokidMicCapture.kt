@@ -13,6 +13,7 @@ internal object RokidMicCapture {
     const val INPUT_CHANNEL_COUNT = 4
     const val SELECTED_CHANNEL_INDEX = 3 // live-mic.sh `default quad4`
     const val FRAMES_PER_CHUNK = 320 // 20 ms at 16 kHz
+    const val PCM_FORMAT = AudioFormat.ENCODING_PCM_16BIT
 
     val channelMask: Int = AudioFormat.CHANNEL_IN_LEFT or
         AudioFormat.CHANNEL_IN_RIGHT or
@@ -21,7 +22,7 @@ internal object RokidMicCapture {
 
     fun audioFormat(sampleRate: Int): AudioFormat = AudioFormat.Builder()
         .setSampleRate(sampleRate)
-        .setEncoding(AudioFormat.ENCODING_PCM_16BIT)
+        .setEncoding(PCM_FORMAT)
         .setChannelMask(channelMask)
         .build()
 

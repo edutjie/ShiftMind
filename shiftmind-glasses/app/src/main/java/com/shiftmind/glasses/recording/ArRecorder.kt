@@ -16,7 +16,7 @@ import com.shiftmind.glasses.hud.HudStateHolder
  * Pipeline (start):
  *   1. [RecordingMuxer.open]                          → MediaStore entry + MediaMuxer
  *   2. [VideoEncoder.prepare]                         → MediaCodec.createInputSurface()
- *   3. (if audio) [AudioEncoder.prepare]              → AudioRecord + AAC codec
+ *   3. (if audio) [AudioEncoder.prepare]              → shared PCM + AAC codec
  *   4. [HudCompositor] wraps encoder surface          → EGL/GL on render thread
  *   5. HudCompositor callback delivers camera-side [SurfaceTexture]
  *   6. Wrap that SurfaceTexture in a [Surface]        → camera output target
@@ -31,13 +31,14 @@ import com.shiftmind.glasses.hud.HudStateHolder
  *   2. Streamer.detachRecordingTarget()               → camera back to ImageReader-only
  *   3. [HudCompositor.release]                        → GL teardown
  *   4. [VideoEncoder.stop]                            → EOS, drain, release codec
- *   5. (if audio) [AudioEncoder.stop]                 → EOS, drain, release AudioRecord+codec
+ *   5. (if audio) [AudioEncoder.stop]                 → unsubscribe, EOS, drain codec
  *   6. [RecordingMuxer.finalize]                      → mux.stop, release, mark IS_PENDING=0
  *   7. Release camera Surface
  */
 class ArRecorder(
     private val context: Context,
     private val streamer: CameraPreviewStreamer,
+    private val micCapture: SharedMicCapture,
     private val videoWidth: Int = 480,
     private val videoHeight: Int = 640,
     private val fps: Int = 24,
@@ -98,7 +99,7 @@ class ArRecorder(
             val venc = VideoEncoder(mux, videoWidth, videoHeight, fps, bitrate).also { it.prepare() }
             videoEncoder = venc
 
-            val aenc = if (withAudio) AudioEncoder(mux).also { it.prepare() } else null
+            val aenc = if (withAudio) AudioEncoder(mux, micCapture).also { it.prepare() } else null
             audioEncoder = aenc
 
             val comp = HudCompositor(

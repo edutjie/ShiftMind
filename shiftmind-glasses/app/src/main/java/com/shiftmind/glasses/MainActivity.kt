@@ -34,6 +34,7 @@ import com.shiftmind.glasses.recording.ArRecorder
 import com.shiftmind.glasses.recording.MicConfigProbe
 import com.shiftmind.glasses.recording.RecordingStateReceiver
 import com.shiftmind.glasses.recording.RokidHudRecorder
+import com.shiftmind.glasses.recording.SharedMicCapture
 import com.shiftmind.glasses.recording.VoiceSessionRecorder
 import com.shiftmind.glasses.service.GlassesService
 import com.shiftmind.glasses.session.CustomerSessionHolder
@@ -52,12 +53,22 @@ import java.util.Locale
 class MainActivity : ComponentActivity() {
 
     private val streamer by lazy { CameraPreviewStreamer(applicationContext) }
-    private val recorder by lazy { ArRecorder(applicationContext, streamer, extraRotationDeg = BuildConfig.RECORDING_ROTATION_DEG) }
+    // The sole AudioRecord owner. AR AAC and live ASR subscribe to this one
+    // source, avoiding concurrent quad-mic reads on the Rokid HAL.
+    private val sharedMicCapture by lazy { SharedMicCapture(applicationContext) }
+    private val recorder by lazy {
+        ArRecorder(
+            applicationContext,
+            streamer,
+            sharedMicCapture,
+            extraRotationDeg = BuildConfig.RECORDING_ROTATION_DEG,
+        )
+    }
     private val hudRecorder by lazy { RokidHudRecorder(applicationContext) }
     private val hudStateClient by lazy { HudStateClient() }
     private val sessionClient by lazy { SessionClient() }
     private val sessionAudioStreamClient by lazy { SessionAudioStreamClient() }
-    private val voiceSessionRecorder by lazy { VoiceSessionRecorder(applicationContext) }
+    private val voiceSessionRecorder by lazy { VoiceSessionRecorder(applicationContext, sharedMicCapture) }
     private val qaClient by lazy { QaClient() }
     private val qaStream by lazy { QaAudioStreamClient() }
     private val qaController by lazy { QaController(voiceSessionRecorder, qaClient, qaStream) }
