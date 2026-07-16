@@ -68,13 +68,7 @@ Critical latency targets: face→HUD ~204 ms (achievable), audio→transcript ~1
   not swap back to an unverified Responses API call unless the SDK usage is
   tested. Missing LLM credentials should degrade to bounded fallback summaries.
 
-## Repo licensing (do not violate)
 
-| Repo | License | Use |
-| :--- | :--- | :--- |
-| zero2005x/RokidAIAssistant | **proprietary** | Study only, no fork, no copy. |
-| Anezium/OverlayRec | GPL-3.0 | Viral. Reuse intent string *facts* only — never copy source files. |
-| zero2005x/M365-Rokid-HUD | **MIT** | Forkable. Useful for HudScreen composable, foreground service pattern, Rokid Maven repo config, permission declarations. |
 
 ## Commands
 

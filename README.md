@@ -116,8 +116,4 @@ Two processes, plain HTTP, no phone middleware. Dev transport is USB-via-`adb re
 
 See `CLAUDE.md` for design constraints + gotchas, `shiftmind-glasses/README.md` and `shiftmind-server/README.md` for module-specific details.
 
-## Still Pending
 
-Trigger classifier (phase 6), VLM relay for product queries (phase 6).
-
-Phase order and per-phase deliverables: `architecture_v2.md` §"Priority order to build" in the vault.
