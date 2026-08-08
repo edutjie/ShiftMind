@@ -2,7 +2,13 @@
 
 AR-glasses shared-memory retrieval system for retail workers. Rokid AR glasses surface a HUD "memory card" when a returning customer is recognized, plus live transcript triggers (product mentions, intent) during the interaction.
 
-**Status:** Production-ready core pipeline. Features include ML Kit face detection, InsightFace+Milvus recognition, live customer sessions with Doubao streaming ASR, AR recording (cam+audio+HUD), LLM summarization, and glasses-side Q&A mode with conversation history for business intelligence queries.
+Features include ML Kit face detection, InsightFace+Milvus recognition, live customer sessions with Doubao streaming ASR, AR recording (cam+audio+HUD), LLM summarization, and glasses-side Q&A mode with conversation history for business intelligence queries.
+
+## Demo & publication
+
+[Watch the video demo](https://youtu.be/zaEACnPiLCE?si=qlAAeHsm5eoWewFa).
+
+**Publication:** The ShiftMind paper has been accepted to [WearAgent 2026](https://wearagent.github.io/), a UbiComp/ISWC Workshop, in the *Companion of the 2026 ACM International Joint Conference on Pervasive and Ubiquitous Computing* (UbiComp Companion '26), October 11–15, 2026, Shanghai, China. DOI: [10.1145/3798063.3839192](https://doi.org/10.1145/3798063.3839192) · ISBN: 979-8-4007-2533-3/2026/10 · CC BY.
 
 ## Repository layout
 
@@ -115,5 +121,3 @@ Two processes, plain HTTP, no phone middleware. Dev transport is USB-via-`adb re
 | **Memory Management** | Per-session summaries + important points. Cumulative memory card (bounded via LLM re-summarization). Session memories embedded into Milvus for semantic recall. |
 
 See `CLAUDE.md` for design constraints + gotchas, `shiftmind-glasses/README.md` and `shiftmind-server/README.md` for module-specific details.
-
-
